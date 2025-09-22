@@ -431,16 +431,14 @@ class GPTTrainer:
         )
 
         self.device = torch.device(device)
-        self.model = SimpleClassifier(self._model_context, model_name=model_name).to(self.device)
+        self.model_name = model_name
         self.criterion = nn.CrossEntropyLoss()
 
-        _layer_assignment, optimizer_assignment, epochs_assignment = _split_generated_assignments(
-            getattr(self.model, "generated_layers_code", "")
-        )
-        self.optimizer = self._build_optimizer(optimizer_assignment, learning_rate)
-        resolved_epochs = self._resolve_training_epochs(epochs_assignment, epochs)
-        self.epochs = resolved_epochs
-        self._model_context.epochs = resolved_epochs
+        self.model: Optional[SimpleClassifier] = None
+        self.optimizer: Optional[torch.optim.Optimizer] = None
+        self._base_learning_rate = float(learning_rate)
+        self._base_epochs = int(epochs)
+        self.epochs = int(epochs)
 
         self.training_history: List[Dict[str, Any]] = []
         self.training_runs: List[Dict[str, Any]] = []
@@ -465,6 +463,8 @@ class GPTTrainer:
 
     def train(self) -> float:
         """Train for one epoch and return average loss."""
+        if self.model is None or self.optimizer is None:
+            raise RuntimeError("Call `fit` before `train`; the model has not been initialized.")
         self.model.train()
         total_loss = 0.0
         for xb, yb in self.train_loader:
@@ -479,6 +479,8 @@ class GPTTrainer:
 
     def evaluate(self) -> Tuple[float, float]:
         """Evaluate on validation set. Returns (avg_loss, accuracy)."""
+        if self.model is None:
+            raise RuntimeError("Call `fit` before `evaluate`; the model has not been initialized.")
         self.model.eval()
         total_loss = 0.0
         correct = 0
@@ -496,6 +498,8 @@ class GPTTrainer:
 
     def fit(self) -> None:
         """Train for the configured number of epochs, printing progress."""
+        self._initialize_training_components()
+
         history: List[Dict[str, Any]] = []
         for epoch in range(1, self.epochs + 1):
             train_loss = self.train()
@@ -527,10 +531,29 @@ class GPTTrainer:
 
     def predict(self, sample: torch.Tensor) -> torch.Tensor:
         """Predict class probabilities for a sample batch."""
+        if self.model is None:
+            raise RuntimeError("Call `fit` before `predict`; the model has not been initialized.")
         with torch.no_grad():
             logits = self.model(sample.to(self.device))
             probs = torch.softmax(logits, dim=1)
             return probs.cpu()
+
+    def _initialize_training_components(self) -> None:
+        """(Re)create the model, optimizer, and training epoch count."""
+        self._model_context.learning_rate = float(self._base_learning_rate)
+        self._model_context.epochs = int(self._base_epochs)
+
+        model = SimpleClassifier(self._model_context, model_name=self.model_name).to(self.device)
+        self.model = model
+
+        _layer_assignment, optimizer_assignment, epochs_assignment = _split_generated_assignments(
+            getattr(model, "generated_layers_code", "")
+        )
+
+        self.optimizer = self._build_optimizer(optimizer_assignment, self._base_learning_rate)
+        resolved_epochs = self._resolve_training_epochs(epochs_assignment, self._base_epochs)
+        self.epochs = resolved_epochs
+        self._model_context.epochs = resolved_epochs
 
     def _append_run_to_log(self, run_record: Dict[str, Any]) -> None:
         try:

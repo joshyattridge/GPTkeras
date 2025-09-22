@@ -7,6 +7,8 @@ def main() -> None:
     xs, ys = make_toy_dataset()
     trainer = GPTTrainer(xs, ys)
     trainer.fit()
+    trainer.fit()
+    trainer.fit()
 
 
     # final testing
