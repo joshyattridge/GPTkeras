@@ -1,14 +1,11 @@
 """Main script for training and evaluating the toy classifier."""
 import torch
-from data import Config, make_toy_dataset
+from data import make_toy_dataset
 from GPTtorch import GPTTrainer
 
 def main() -> None:
-    cfg = Config()
-    print(f"Using device: {cfg.device}")
-
-    xs, ys = make_toy_dataset(cfg)
-    trainer = GPTTrainer(cfg, xs, ys)
+    xs, ys = make_toy_dataset()
+    trainer = GPTTrainer(xs, ys)
     trainer.fit()
 
 

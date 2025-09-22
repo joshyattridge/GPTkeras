@@ -8,32 +8,19 @@ import torch
 from torch import Tensor
 from torch.utils.data import TensorDataset
 
-@dataclass
-class Config:
-    seed: int = 13
-    num_samples: int = 1000
-    train_split: float = 0.8
-    input_dim: int = 2
-    hidden_dim: int = 16
-    num_classes: int = 2
-    batch_size: int = 64
-    learning_rate: float = 1e-2
-    epochs: int = 25
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-def make_toy_dataset(cfg: Config) -> Tuple[Tensor, Tensor]:
+def make_toy_dataset() -> Tuple[Tensor, Tensor]:
     """Generate a more complex, multi-class, noisy dataset."""
-    torch.manual_seed(cfg.seed)
-    random.seed(cfg.seed)
+    torch.manual_seed(10)
+    random.seed(10)
 
     # Three classes: inner circle, middle ring, outer ring
     num_classes = 3
-    cfg.num_classes = num_classes
-    radii = torch.empty(cfg.num_samples)
-    angles = torch.rand(cfg.num_samples) * 2 * math.pi
-    labels = torch.empty(cfg.num_samples, dtype=torch.long)
+    num_samples = 1000
+    radii = torch.empty(num_samples)
+    angles = torch.rand(num_samples) * 2 * math.pi
+    labels = torch.empty(num_samples, dtype=torch.long)
 
-    for i in range(cfg.num_samples):
+    for i in range(num_samples):
         p = random.random()
         if p < 0.33:
             # Inner circle, class 0
@@ -49,8 +36,8 @@ def make_toy_dataset(cfg: Config) -> Tuple[Tensor, Tensor]:
             labels[i] = 2
 
     # Add noise and overlap
-    radii += torch.randn(cfg.num_samples) * 0.5
-    angles += torch.randn(cfg.num_samples) * 0.2
+    radii += torch.randn(num_samples) * 0.5
+    angles += torch.randn(num_samples) * 0.2
 
     xs = torch.stack((radii * torch.cos(angles), radii * torch.sin(angles)), dim=1)
     ys = labels
