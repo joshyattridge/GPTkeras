@@ -60,18 +60,22 @@ def _normalize_assignment(text: str) -> str:
     return " ".join(text.split())
 
 
-def _split_layers_and_optimizer(assignments: str) -> Tuple[str, Optional[str]]:
-    """Extract layer assignment and optional optimizer instruction."""
+def _split_generated_assignments(assignments: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """Extract layer, optimizer, and epoch assignments from the generated text."""
     optimizer_prefix = "self.optimizer ="
+    epochs_prefix = "self.training_epochs ="
     lines = [line.strip() for line in assignments.splitlines() if line.strip()]
     layer_lines: List[str] = []
     optimizer_line: Optional[str] = None
+    epochs_line: Optional[str] = None
     for line in lines:
         if line.startswith(optimizer_prefix):
             optimizer_line = line
+        elif line.startswith(epochs_prefix):
+            epochs_line = line
         else:
             layer_lines.append(line)
-    return "\n".join(layer_lines), optimizer_line
+    return "\n".join(layer_lines), optimizer_line, epochs_line
 
 
 def _load_recent_training_runs(log_path: Path, limit: int = 5) -> List[Dict[str, Any]]:
@@ -192,7 +196,7 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
     used_assignments: List[str] = []
     seen_assignments = set()
     for run in previous_runs:
-        layers_code, _ = _split_layers_and_optimizer(run.get("generated_layers", ""))
+        layers_code, _, _ = _split_generated_assignments(run.get("generated_layers", ""))
         assignment = _normalize_assignment(layers_code)
         if not assignment or assignment in seen_assignments:
             continue
@@ -238,8 +242,9 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
         " number of class scores."
         "Also choose an optimizer and learning-rate configuration that would help this"
         " model converge efficiently."
-        "Respond with two Python assignments on separate lines: first `self.layers = ...`,"
-        " then `self.optimizer = ...`. Do not include code fences or additional text."
+        "Respond with three Python assignments on separate lines: first `self.layers = ...`,"
+        " then `self.optimizer = ...`, and finally `self.training_epochs = ...`."
+        "Do not include code fences or additional text."
     )
 
     messages: List[Dict[str, str]] = [
@@ -261,23 +266,64 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
     for attempt in range(1, max_attempts + 1):
         response = _call_openai_chat(messages, model_name, api_key)
         cleaned = _strip_code_fences(response)
-        layers_part, optimizer_part = _split_layers_and_optimizer(cleaned)
+        layers_part, optimizer_part, epochs_part = _split_generated_assignments(cleaned)
         normalized = _normalize_assignment(layers_part)
 
-        if normalized and normalized not in seen_assignments and optimizer_part:
-            return "\n".join([layers_part, optimizer_part])
+        if not layers_part or "self.layers" not in layers_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Reminder: respond with `self.layers = ...`, `self.optimizer = ...`,"
+                        " and `self.training_epochs = ...` as separate lines."
+                    ),
+                }
+            )
+            continue
 
-        messages.append({"role": "assistant", "content": cleaned})
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "We have already used that exact configuration. Please return"
-                    " a different layer assignment that is not identical to any"
-                    " previously listed."
-                ),
-            }
-        )
+        if normalized in seen_assignments:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "We have already used that exact configuration. Please return"
+                        " a different layer assignment that is not identical to any"
+                        " previously listed."
+                    ),
+                }
+            )
+            continue
+
+        if not optimizer_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You must also provide an optimizer assignment on a separate"
+                        " line in the form `self.optimizer = ...`."
+                    ),
+                }
+            )
+            continue
+
+        if not epochs_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Please include a training duration assignment like"
+                        " `self.training_epochs = <positive integer>`."
+                    ),
+                }
+            )
+            continue
+
+        return "\n".join([layers_part, optimizer_part, epochs_part])
+
 
     if normalized:
         raise RuntimeError(
@@ -307,11 +353,12 @@ class SimpleClassifier(nn.Module):
         print("Generated layers assignment:")
         print(generated_layers)
 
-        layer_code, optimizer_code = _split_layers_and_optimizer(generated_layers)
+        layer_code, optimizer_code, epochs_code = _split_generated_assignments(generated_layers)
 
         # Keep a copy so training summaries can reference the generated architecture
         self.generated_layers_code = generated_layers
         self.generated_optimizer_code = optimizer_code or ""
+        self.generated_epochs_code = epochs_code or ""
 
         if layer_code and "self.layers" in layer_code:
             try:
@@ -347,10 +394,13 @@ class GPTTrainer:
         self.device = torch.device(cfg.device)
         self.model = SimpleClassifier(cfg).to(self.device)
         self.criterion = nn.CrossEntropyLoss()
-        _layer_assignment, optimizer_assignment = _split_layers_and_optimizer(
+        _layer_assignment, optimizer_assignment, epochs_assignment = _split_generated_assignments(
             getattr(self.model, "generated_layers_code", "")
         )
         self.optimizer = self._build_optimizer(optimizer_assignment, cfg.learning_rate)
+        resolved_epochs = self._resolve_training_epochs(epochs_assignment, cfg.epochs)
+        self.epochs = resolved_epochs
+        self.cfg.epochs = resolved_epochs
         self.training_history: List[Dict[str, Any]] = []
         self.training_runs: List[Dict[str, Any]] = []
         self.latest_results: Dict[str, Any] = {}
@@ -407,11 +457,11 @@ class GPTTrainer:
     def fit(self):
         """Train for cfg.epochs epochs, printing progress."""
         history: List[Dict[str, Any]] = []
-        for epoch in range(1, self.cfg.epochs + 1):
+        for epoch in range(1, self.epochs + 1):
             train_loss = self.train()
             val_loss, val_acc = self.evaluate()
             print(
-                f"Epoch {epoch}/{self.cfg.epochs} | Train loss: {train_loss:.3f} "
+                f"Epoch {epoch}/{self.epochs} | Train loss: {train_loss:.3f} "
                 f"| Val loss: {val_loss:.3f} | Val accuracy: {val_acc:.2%}"
             )
             history.append(
@@ -473,3 +523,21 @@ class GPTTrainer:
                 print(f"Warning: failed to apply generated optimizer command '{command}': {exc}")
 
         return torch.optim.Adam(self.model.parameters(), lr=fallback_lr)
+
+    def _resolve_training_epochs(self, command: Optional[str], fallback_epochs: int) -> int:
+        if command:
+            try:
+                class _EpochContext:
+                    def __init__(self, default_epochs: int) -> None:
+                        self.training_epochs = default_epochs
+
+                context = _EpochContext(fallback_epochs)
+                exec(command, {"cfg": self.cfg}, {"self": context})
+                value = getattr(context, "training_epochs", fallback_epochs)
+                resolved = int(value)
+                if resolved > 0:
+                    return resolved
+            except Exception as exc:
+                print(f"Warning: failed to apply generated training epochs command '{command}': {exc}")
+
+        return fallback_epochs
