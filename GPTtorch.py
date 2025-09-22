@@ -2,6 +2,7 @@
 import os
 import json
 import inspect
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
@@ -141,6 +142,9 @@ class SimpleClassifier(nn.Module):
         print("Generated layers assignment:")
         print(generated_layers)
 
+        # Keep a copy so training summaries can reference the generated architecture
+        self.generated_layers_code = generated_layers
+
         if generated_layers and "self.layers" in generated_layers:
             try:
                 exec(
@@ -164,12 +168,16 @@ class GPTTrainer:
     """
     Utility class for training and evaluating a SimpleClassifier.
     """
-    def __init__(self, cfg: Config, xs: torch.Tensor, ys: torch.Tensor):
+    def __init__(self, cfg: Config, xs: torch.Tensor, ys: torch.Tensor, results_log_path: str = "training_runs.jsonl") -> None:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.model = SimpleClassifier(cfg).to(self.device)
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg.learning_rate)
+        self.training_history: List[Dict[str, Any]] = []
+        self.training_runs: List[Dict[str, Any]] = []
+        self.latest_results: Dict[str, Any] = {}
+        self.results_log_path = Path(results_log_path)
 
         train_ds, val_ds = self.split_dataset(xs, ys, cfg.train_split)
         self.train_loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
@@ -220,6 +228,7 @@ class GPTTrainer:
 
     def fit(self):
         """Train for cfg.epochs epochs, printing progress."""
+        history: List[Dict[str, Any]] = []
         for epoch in range(1, self.cfg.epochs + 1):
             train_loss = self.train()
             val_loss, val_acc = self.evaluate()
@@ -227,6 +236,26 @@ class GPTTrainer:
                 f"Epoch {epoch}/{self.cfg.epochs} | Train loss: {train_loss:.3f} "
                 f"| Val loss: {val_loss:.3f} | Val accuracy: {val_acc:.2%}"
             )
+            history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": float(train_loss),
+                    "val_loss": float(val_loss),
+                    "val_acc": float(val_acc),
+                }
+            )
+
+        history_copy = [dict(record) for record in history]
+        final_metrics = dict(history_copy[-1]) if history_copy else {}
+        run_record = {
+            "generated_layers": getattr(self.model, "generated_layers_code", ""),
+            "history": history_copy,
+            "final_metrics": final_metrics,
+        }
+        self.training_history = history_copy
+        self.latest_results = run_record
+        self.training_runs.append(run_record)
+        self._append_run_to_log(run_record)
 
     def predict(self, sample: torch.Tensor) -> torch.Tensor:
         """Predict class probabilities for a sample batch."""
@@ -234,3 +263,13 @@ class GPTTrainer:
             logits = self.model(sample.to(self.device))
             probs = torch.softmax(logits, dim=1)
             return probs.cpu()
+
+    def _append_run_to_log(self, run_record: Dict[str, Any]) -> None:
+        try:
+            log_path = self.results_log_path
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(run_record))
+                log_file.write("\n")
+        except OSError as exc:
+            print(f"Warning: unable to write training log to {log_path}: {exc}")
