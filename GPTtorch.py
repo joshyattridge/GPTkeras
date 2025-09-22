@@ -11,7 +11,6 @@ import torch
 from torch import nn, Tensor
 from torch.utils.data import TensorDataset
 
-# Optional OpenAI import
 try:
     import openai  # type: ignore[import-untyped]
 except ImportError:
@@ -180,7 +179,12 @@ def _call_openai_chat(messages: List[Dict[str, str]], model_name: str, api_key: 
 
     raise RuntimeError("Unsupported OpenAI client version detected.")
 
-def generate_layers(cfg: Any, model_name: str = "gpt-4o-mini") -> str:
+def generate_layers(
+    cfg: Any,
+    model_name: str = "gpt-4o-mini",
+    *,
+    feedback: Optional[str] = None,
+) -> str:
     """
     Ask ChatGPT to propose an assignment for `self.layers` based on available layers.
     Returns a string assignment for self.layers.
@@ -228,19 +232,33 @@ def generate_layers(cfg: Any, model_name: str = "gpt-4o-mini") -> str:
     else:
         prior_assignments_context = ""
 
+    feedback_context = ""
+    if feedback:
+        summarized = feedback.strip()
+        if summarized:
+            feedback_context = (
+                "Previous attempt failed with the following issue:\n"
+                f"{summarized}\n\n"
+                "Please adjust the generated assignments to avoid this problem.\n"
+            )
+
     layer_catalog = json.dumps(available_layers, indent=2)
     base_user_content = (
         "Here is the list of available torch.nn layers and their constructor"
         f" details:\n{layer_catalog}\n\n"
         f"{history_context}\n"
         f"{prior_assignments_context}"
+        f"{feedback_context}"
         "Using only these building blocks, craft a PyTorch `nn.Sequential` suitable"
         f" for a classifier that accepts inputs of dimension {cfg.input_dim} and outputs"
         f" {cfg.num_classes} logits. Explore different depths and hidden widths when"
         " prior performance plateaus, but ensure the final module produces the correct"
         " number of class scores."
         "Also choose an optimizer and learning-rate configuration that would help this"
-        " model converge efficiently."
+        " model converge efficiently. When defining the optimizer, reference"
+        " `self.model.parameters()` (or call `self.parameters()` within the execution"
+        " context). Do not reference `self.layers` or other attributes that are not"
+        " guaranteed to exist."
         "Respond with three Python assignments on separate lines: first `self.layers = ...`,"
         " then `self.optimizer = ...`, and finally `self.training_epochs = ...`."
         "Do not include code fences or additional text."
@@ -259,6 +277,18 @@ def generate_layers(cfg: Any, model_name: str = "gpt-4o-mini") -> str:
             "content": base_user_content,
         },
     ]
+
+    if feedback_context:
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Address the error described above by updating the optimizer and/or "
+                    "training epoch assignments so that they can be executed without raising "
+                    "exceptions."
+                ),
+            }
+        )
 
     max_attempts = 3
     normalized = ""
@@ -342,10 +372,15 @@ class SimpleClassifier(nn.Module):
     Dynamically generated classifier using OpenAI API.
     The layers are assigned by executing code returned from generate_layers().
     """
-    def __init__(self, cfg: Any, model_name: str = "gpt-4o-mini") -> None:
+    def __init__(
+        self,
+        cfg: Any,
+        model_name: str = "gpt-4o-mini",
+        feedback: Optional[str] = None,
+    ) -> None:
         super().__init__()
         try:
-            generated_layers = generate_layers(cfg, model_name=model_name)
+            generated_layers = generate_layers(cfg, model_name=model_name, feedback=feedback)
         except Exception as exc:
             raise RuntimeError(f"generate_layers failed: {exc}")
 
@@ -389,8 +424,6 @@ class GPTTrainer:
         ys: torch.Tensor,
         *,
         device: Optional[str] = None,
-        learning_rate: float = 1e-3,
-        epochs: int = 20,
         train_split: float = 0.8,
         batch_size: int = 64,
         results_log_path: Optional[str] = "training_runs.jsonl",
@@ -404,10 +437,6 @@ class GPTTrainer:
             raise ValueError("`train_split` must be between 0 and 1.")
         if batch_size <= 0:
             raise ValueError("`batch_size` must be a positive integer.")
-        if epochs <= 0:
-            raise ValueError("`epochs` must be a positive integer.")
-        if learning_rate <= 0:
-            raise ValueError("`learning_rate` must be positive.")
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -424,8 +453,8 @@ class GPTTrainer:
             num_classes=num_classes,
             results_log_path=log_path_value,
             device=device,
-            learning_rate=float(learning_rate),
-            epochs=int(epochs),
+            learning_rate=None,
+            epochs=None,
             train_split=float(train_split),
             batch_size=int(batch_size),
         )
@@ -436,9 +465,7 @@ class GPTTrainer:
 
         self.model: Optional[SimpleClassifier] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
-        self._base_learning_rate = float(learning_rate)
-        self._base_epochs = int(epochs)
-        self.epochs = int(epochs)
+        self.epochs = 0
 
         self.training_history: List[Dict[str, Any]] = []
         self.training_runs: List[Dict[str, Any]] = []
@@ -540,20 +567,88 @@ class GPTTrainer:
 
     def _initialize_training_components(self) -> None:
         """(Re)create the model, optimizer, and training epoch count."""
-        self._model_context.learning_rate = float(self._base_learning_rate)
-        self._model_context.epochs = int(self._base_epochs)
+        max_attempts = 5
+        feedback: Optional[str] = None
+        last_error: Optional[str] = None
 
-        model = SimpleClassifier(self._model_context, model_name=self.model_name).to(self.device)
-        self.model = model
+        self.model = None
+        self.optimizer = None
+        self.epochs = 0
 
-        _layer_assignment, optimizer_assignment, epochs_assignment = _split_generated_assignments(
-            getattr(model, "generated_layers_code", "")
+        for attempt in range(1, max_attempts + 1):
+            self._model_context.learning_rate = None
+            self._model_context.epochs = None
+
+            try:
+                model = SimpleClassifier(
+                    self._model_context,
+                    model_name=self.model_name,
+                    feedback=feedback,
+                ).to(self.device)
+            except Exception as exc:
+                error_text = str(exc)
+                last_error = error_text
+                feedback = f"Layer generation failed with error: {error_text}"
+                print(
+                    f"Regenerating architecture (attempt {attempt}/{max_attempts}) after failure: {error_text}"
+                )
+                continue
+
+            self.model = model
+
+            _layer_assignment, optimizer_assignment, epochs_assignment = _split_generated_assignments(
+                getattr(model, "generated_layers_code", "")
+            )
+
+            try:
+                optimizer = self._build_optimizer(optimizer_assignment)
+            except RuntimeError as exc:
+                command = (optimizer_assignment or "<missing optimizer command>").strip()
+                error_text = str(exc)
+                last_error = f"Optimizer command `{command}` failed: {error_text}"
+                if "no attribute 'layers'" in error_text:
+                    last_error += (
+                        " Use `self.model.parameters()` (or `self.parameters()` within the optimizer"
+                        " context) when constructing the optimizer."
+                    )
+                feedback = last_error
+                print(
+                    f"Regenerating architecture (attempt {attempt}/{max_attempts}) after failure: {error_text}"
+                )
+                self.model = None
+                self.optimizer = None
+                continue
+
+            try:
+                resolved_epochs = self._resolve_training_epochs(epochs_assignment)
+            except RuntimeError as exc:
+                command = (epochs_assignment or "<missing training epochs command>").strip()
+                error_text = str(exc)
+                last_error = f"Training epochs command `{command}` failed: {error_text}"
+                feedback = last_error
+                print(
+                    f"Regenerating architecture (attempt {attempt}/{max_attempts}) after failure: {error_text}"
+                )
+                self.model = None
+                self.optimizer = None
+                continue
+
+            self.optimizer = optimizer
+            self.epochs = resolved_epochs
+            self._model_context.epochs = resolved_epochs
+            if optimizer.param_groups:
+                lr_value = optimizer.param_groups[0].get("lr")
+                if lr_value is not None:
+                    self._model_context.learning_rate = float(lr_value)
+            else:
+                self._model_context.learning_rate = None
+
+            return
+
+        raise RuntimeError(
+            "Failed to initialize training components after multiple regeneration attempts. "
+            f"Last error: {last_error}"
         )
-
-        self.optimizer = self._build_optimizer(optimizer_assignment, self._base_learning_rate)
-        resolved_epochs = self._resolve_training_epochs(epochs_assignment, self._base_epochs)
-        self.epochs = resolved_epochs
-        self._model_context.epochs = resolved_epochs
 
     def _append_run_to_log(self, run_record: Dict[str, Any]) -> None:
         try:
@@ -565,42 +660,59 @@ class GPTTrainer:
         except OSError as exc:
             print(f"Warning: unable to write training log to {log_path}: {exc}")
 
-    def _build_optimizer(self, command: Optional[str], fallback_lr: float) -> torch.optim.Optimizer:
-        if command:
-            try:
-                class _OptimizerContext:
-                    def __init__(self, trainer: "GPTTrainer") -> None:
-                        self._trainer = trainer
-                        self.model = trainer.model
-                        self.optimizer: Optional[torch.optim.Optimizer] = None
+    def _build_optimizer(self, command: Optional[str]) -> torch.optim.Optimizer:
+        if not command:
+            raise RuntimeError("Generated response omitted an optimizer assignment.")
 
-                    def parameters(self):
-                        return self.model.parameters()
+        try:
+            class _OptimizerContext:
+                def __init__(self, trainer: "GPTTrainer") -> None:
+                    self._trainer = trainer
+                    self.model = trainer.model
+                    self.optimizer: Optional[torch.optim.Optimizer] = None
 
-                context = _OptimizerContext(self)
-                exec(command, {"torch": torch, "nn": nn, "cfg": self._model_context}, {"self": context})
-                optimizer = context.optimizer
-                if isinstance(optimizer, torch.optim.Optimizer):
-                    return optimizer
-            except Exception as exc:
-                print(f"Warning: failed to apply generated optimizer command '{command}': {exc}")
+                def parameters(self):
+                    return self.model.parameters()
 
-        return torch.optim.Adam(self.model.parameters(), lr=fallback_lr)
+            context = _OptimizerContext(self)
+            exec(command, {"torch": torch, "nn": nn, "cfg": self._model_context}, {"self": context})
+            optimizer = context.optimizer
+        except Exception as exc:
+            raise RuntimeError(
+                f"Generated optimizer command failed with error: {exc}"
+            ) from exc
 
-    def _resolve_training_epochs(self, command: Optional[str], fallback_epochs: int) -> int:
-        if command:
-            try:
-                class _EpochContext:
-                    def __init__(self, default_epochs: int) -> None:
-                        self.training_epochs = default_epochs
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            raise RuntimeError(
+                "Generated optimizer command did not assign a torch.optim.Optimizer to `self.optimizer`."
+            )
 
-                context = _EpochContext(fallback_epochs)
-                exec(command, {"cfg": self._model_context}, {"self": context})
-                value = getattr(context, "training_epochs", fallback_epochs)
-                resolved = int(value)
-                if resolved > 0:
-                    return resolved
-            except Exception as exc:
-                print(f"Warning: failed to apply generated training epochs command '{command}': {exc}")
+        return optimizer
 
-        return fallback_epochs
+    def _resolve_training_epochs(self, command: Optional[str]) -> int:
+        if not command:
+            raise RuntimeError("Generated response omitted a training epochs assignment.")
+
+        try:
+            class _EpochContext:
+                def __init__(self) -> None:
+                    self.training_epochs: Optional[int] = None
+
+            context = _EpochContext()
+            exec(command, {"cfg": self._model_context}, {"self": context})
+            value = getattr(context, "training_epochs", None)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Generated training epochs command failed with error: {exc}"
+            ) from exc
+
+        if value is None:
+            raise RuntimeError(
+                "Generated training epochs command did not assign `self.training_epochs`."
+            )
+
+        resolved = int(value)
+        if resolved <= 0:
+            raise RuntimeError("Generated training epochs must be a positive integer.")
+
+        return resolved

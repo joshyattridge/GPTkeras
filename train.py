@@ -8,7 +8,6 @@ def main() -> None:
     trainer = GPTTrainer(xs, ys)
     trainer.fit()
     trainer.fit()
-    trainer.fit()
 
 
     # final testing
