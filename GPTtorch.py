@@ -4,13 +4,12 @@ import json
 import inspect
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn, Tensor
 from torch.utils.data import TensorDataset
-
-from data import Config
 
 # Optional OpenAI import
 try:
@@ -181,7 +180,7 @@ def _call_openai_chat(messages: List[Dict[str, str]], model_name: str, api_key: 
 
     raise RuntimeError("Unsupported OpenAI client version detected.")
 
-def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
+def generate_layers(cfg: Any, model_name: str = "gpt-4o-mini") -> str:
     """
     Ask ChatGPT to propose an assignment for `self.layers` based on available layers.
     Returns a string assignment for self.layers.
@@ -343,10 +342,10 @@ class SimpleClassifier(nn.Module):
     Dynamically generated classifier using OpenAI API.
     The layers are assigned by executing code returned from generate_layers().
     """
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Any, model_name: str = "gpt-4o-mini") -> None:
         super().__init__()
         try:
-            generated_layers = generate_layers(cfg)
+            generated_layers = generate_layers(cfg, model_name=model_name)
         except Exception as exc:
             raise RuntimeError(f"generate_layers failed: {exc}")
 
@@ -383,36 +382,77 @@ class GPTTrainer:
     """
     Utility class for training and evaluating a SimpleClassifier.
     """
+
     def __init__(
         self,
-        cfg: Config,
         xs: torch.Tensor,
         ys: torch.Tensor,
-        results_log_path: Optional[str] = None,
+        *,
+        device: Optional[str] = None,
+        learning_rate: float = 1e-3,
+        epochs: int = 20,
+        train_split: float = 0.8,
+        batch_size: int = 64,
+        results_log_path: Optional[str] = "training_runs.jsonl",
+        model_name: str = "gpt-4o-mini",
     ) -> None:
-        self.cfg = cfg
-        self.device = torch.device(cfg.device)
-        self.model = SimpleClassifier(cfg).to(self.device)
+        if xs.ndim != 2:
+            raise ValueError("`xs` must be a 2D tensor shaped [num_samples, num_features].")
+        if ys.ndim != 1:
+            raise ValueError("`ys` must be a 1D tensor of class labels.")
+        if train_split <= 0 or train_split >= 1:
+            raise ValueError("`train_split` must be between 0 and 1.")
+        if batch_size <= 0:
+            raise ValueError("`batch_size` must be a positive integer.")
+        if epochs <= 0:
+            raise ValueError("`epochs` must be a positive integer.")
+        if learning_rate <= 0:
+            raise ValueError("`learning_rate` must be positive.")
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        input_dim = xs.shape[1]
+        unique_classes = torch.unique(ys)
+        if unique_classes.numel() == 0:
+            raise ValueError("`ys` must contain at least one class label.")
+        num_classes = int(unique_classes.numel())
+
+        log_path_value = str(results_log_path) if results_log_path is not None else "training_runs.jsonl"
+
+        self._model_context = SimpleNamespace(
+            input_dim=int(input_dim),
+            num_classes=num_classes,
+            results_log_path=log_path_value,
+            device=device,
+            learning_rate=float(learning_rate),
+            epochs=int(epochs),
+            train_split=float(train_split),
+            batch_size=int(batch_size),
+        )
+
+        self.device = torch.device(device)
+        self.model = SimpleClassifier(self._model_context, model_name=model_name).to(self.device)
         self.criterion = nn.CrossEntropyLoss()
+
         _layer_assignment, optimizer_assignment, epochs_assignment = _split_generated_assignments(
             getattr(self.model, "generated_layers_code", "")
         )
-        self.optimizer = self._build_optimizer(optimizer_assignment, cfg.learning_rate)
-        resolved_epochs = self._resolve_training_epochs(epochs_assignment, cfg.epochs)
+        self.optimizer = self._build_optimizer(optimizer_assignment, learning_rate)
+        resolved_epochs = self._resolve_training_epochs(epochs_assignment, epochs)
         self.epochs = resolved_epochs
-        self.cfg.epochs = resolved_epochs
+        self._model_context.epochs = resolved_epochs
+
         self.training_history: List[Dict[str, Any]] = []
         self.training_runs: List[Dict[str, Any]] = []
         self.latest_results: Dict[str, Any] = {}
-        resolved_log_path = results_log_path or getattr(cfg, "results_log_path", "training_runs.jsonl")
-        self.results_log_path = Path(resolved_log_path).expanduser()
+        self.results_log_path = Path(log_path_value).expanduser()
 
-        train_ds, val_ds = self.split_dataset(xs, ys, cfg.train_split)
-        self.train_loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-        self.val_loader = torch.utils.data.DataLoader(val_ds, batch_size=cfg.batch_size)
+        train_ds, val_ds = self.split_dataset(xs, ys, train_split)
+        self.train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        self.val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size)
 
     @staticmethod
-    def split_dataset(xs: torch.Tensor, ys: torch.Tensor, train_ratio: float):
+    def split_dataset(xs: torch.Tensor, ys: torch.Tensor, train_ratio: float) -> Tuple[TensorDataset, TensorDataset]:
         """Split dataset into train and validation sets."""
         num_train = int(len(xs) * train_ratio)
         indices = torch.randperm(len(xs))
@@ -437,7 +477,7 @@ class GPTTrainer:
             total_loss += loss.item() * xb.size(0)
         return total_loss / len(self.train_loader.dataset)
 
-    def evaluate(self) -> (float, float):
+    def evaluate(self) -> Tuple[float, float]:
         """Evaluate on validation set. Returns (avg_loss, accuracy)."""
         self.model.eval()
         total_loss = 0.0
@@ -454,8 +494,8 @@ class GPTTrainer:
         accuracy = correct / len(self.val_loader.dataset)
         return avg_loss, accuracy
 
-    def fit(self):
-        """Train for cfg.epochs epochs, printing progress."""
+    def fit(self) -> None:
+        """Train for the configured number of epochs, printing progress."""
         history: List[Dict[str, Any]] = []
         for epoch in range(1, self.epochs + 1):
             train_loss = self.train()
@@ -515,7 +555,7 @@ class GPTTrainer:
                         return self.model.parameters()
 
                 context = _OptimizerContext(self)
-                exec(command, {"torch": torch, "nn": nn}, {"self": context})
+                exec(command, {"torch": torch, "nn": nn, "cfg": self._model_context}, {"self": context})
                 optimizer = context.optimizer
                 if isinstance(optimizer, torch.optim.Optimizer):
                     return optimizer
@@ -532,7 +572,7 @@ class GPTTrainer:
                         self.training_epochs = default_epochs
 
                 context = _EpochContext(fallback_epochs)
-                exec(command, {"cfg": self.cfg}, {"self": context})
+                exec(command, {"cfg": self._model_context}, {"self": context})
                 value = getattr(context, "training_epochs", fallback_epochs)
                 resolved = int(value)
                 if resolved > 0:
