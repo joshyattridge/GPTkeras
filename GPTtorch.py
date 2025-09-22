@@ -4,7 +4,7 @@ import json
 import inspect
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn, Tensor
@@ -58,6 +58,20 @@ def _format_for_responses(messages: List[Dict[str, str]]) -> List[Dict[str, Any]
 def _normalize_assignment(text: str) -> str:
     """Collapse whitespace so layer assignments can be compared reliably."""
     return " ".join(text.split())
+
+
+def _split_layers_and_optimizer(assignments: str) -> Tuple[str, Optional[str]]:
+    """Extract layer assignment and optional optimizer instruction."""
+    optimizer_prefix = "self.optimizer ="
+    lines = [line.strip() for line in assignments.splitlines() if line.strip()]
+    layer_lines: List[str] = []
+    optimizer_line: Optional[str] = None
+    for line in lines:
+        if line.startswith(optimizer_prefix):
+            optimizer_line = line
+        else:
+            layer_lines.append(line)
+    return "\n".join(layer_lines), optimizer_line
 
 
 def _load_recent_training_runs(log_path: Path, limit: int = 5) -> List[Dict[str, Any]]:
@@ -178,7 +192,8 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
     used_assignments: List[str] = []
     seen_assignments = set()
     for run in previous_runs:
-        assignment = _normalize_assignment(run.get("generated_layers", ""))
+        layers_code, _ = _split_layers_and_optimizer(run.get("generated_layers", ""))
+        assignment = _normalize_assignment(layers_code)
         if not assignment or assignment in seen_assignments:
             continue
         seen_assignments.add(assignment)
@@ -220,8 +235,11 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
         f" for a classifier that accepts inputs of dimension {cfg.input_dim} and outputs"
         f" {cfg.num_classes} logits. Explore different depths and hidden widths when"
         " prior performance plateaus, but ensure the final module produces the correct"
-        " number of class scores. Only respond with the Python assignment"
-        " statement `self.layers = ...` and nothing else. Do not include code fences."
+        " number of class scores."
+        "Also choose an optimizer and learning-rate configuration that would help this"
+        " model converge efficiently."
+        "Respond with two Python assignments on separate lines: first `self.layers = ...`,"
+        " then `self.optimizer = ...`. Do not include code fences or additional text."
     )
 
     messages: List[Dict[str, str]] = [
@@ -243,10 +261,11 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
     for attempt in range(1, max_attempts + 1):
         response = _call_openai_chat(messages, model_name, api_key)
         cleaned = _strip_code_fences(response)
-        normalized = _normalize_assignment(cleaned)
+        layers_part, optimizer_part = _split_layers_and_optimizer(cleaned)
+        normalized = _normalize_assignment(layers_part)
 
-        if normalized and normalized not in seen_assignments:
-            return cleaned
+        if normalized and normalized not in seen_assignments and optimizer_part:
+            return "\n".join([layers_part, optimizer_part])
 
         messages.append({"role": "assistant", "content": cleaned})
         messages.append(
@@ -288,13 +307,16 @@ class SimpleClassifier(nn.Module):
         print("Generated layers assignment:")
         print(generated_layers)
 
+        layer_code, optimizer_code = _split_layers_and_optimizer(generated_layers)
+
         # Keep a copy so training summaries can reference the generated architecture
         self.generated_layers_code = generated_layers
+        self.generated_optimizer_code = optimizer_code or ""
 
-        if generated_layers and "self.layers" in generated_layers:
+        if layer_code and "self.layers" in layer_code:
             try:
                 exec(
-                    generated_layers,
+                    layer_code,
                     {"nn": nn, "torch": torch, "cfg": cfg},
                     {"self": self},
                 )
@@ -325,7 +347,10 @@ class GPTTrainer:
         self.device = torch.device(cfg.device)
         self.model = SimpleClassifier(cfg).to(self.device)
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg.learning_rate)
+        _layer_assignment, optimizer_assignment = _split_layers_and_optimizer(
+            getattr(self.model, "generated_layers_code", "")
+        )
+        self.optimizer = self._build_optimizer(optimizer_assignment, cfg.learning_rate)
         self.training_history: List[Dict[str, Any]] = []
         self.training_runs: List[Dict[str, Any]] = []
         self.latest_results: Dict[str, Any] = {}
@@ -426,3 +451,25 @@ class GPTTrainer:
                 log_file.write("\n")
         except OSError as exc:
             print(f"Warning: unable to write training log to {log_path}: {exc}")
+
+    def _build_optimizer(self, command: Optional[str], fallback_lr: float) -> torch.optim.Optimizer:
+        if command:
+            try:
+                class _OptimizerContext:
+                    def __init__(self, trainer: "GPTTrainer") -> None:
+                        self._trainer = trainer
+                        self.model = trainer.model
+                        self.optimizer: Optional[torch.optim.Optimizer] = None
+
+                    def parameters(self):
+                        return self.model.parameters()
+
+                context = _OptimizerContext(self)
+                exec(command, {"torch": torch, "nn": nn}, {"self": context})
+                optimizer = context.optimizer
+                if isinstance(optimizer, torch.optim.Optimizer):
+                    return optimizer
+            except Exception as exc:
+                print(f"Warning: failed to apply generated optimizer command '{command}': {exc}")
+
+        return torch.optim.Adam(self.model.parameters(), lr=fallback_lr)
