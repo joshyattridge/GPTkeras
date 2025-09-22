@@ -2,8 +2,9 @@
 import os
 import json
 import inspect
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import nn, Tensor
@@ -53,6 +54,76 @@ def _format_for_responses(messages: List[Dict[str, str]]) -> List[Dict[str, Any]
         for m in messages
     ]
 
+
+def _load_recent_training_runs(log_path: Path, limit: int = 5) -> List[Dict[str, Any]]:
+    """Read the most recent training run records from a JSONL log file."""
+    if limit <= 0:
+        return []
+    if not log_path.exists():
+        return []
+    try:
+        with log_path.open("r", encoding="utf-8") as handle:
+            recent_lines = deque(handle, maxlen=limit)
+    except OSError:
+        return []
+
+    runs: List[Dict[str, Any]] = []
+    for raw_line in recent_lines:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            runs.append(json.loads(raw_line))
+        except json.JSONDecodeError:
+            continue
+    return runs
+
+
+def _summarize_runs_for_prompt(runs: List[Dict[str, Any]]) -> str:
+    """Create a concise summary of prior runs ordered by validation accuracy."""
+    if not runs:
+        return ""
+
+    def _as_float(value: Any) -> Any:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    sorted_runs = sorted(
+        runs,
+        key=lambda rec: _as_float(rec.get("final_metrics", {}).get("val_acc")) or float("-inf"),
+        reverse=True,
+    )
+
+    summary_lines: List[str] = []
+    for idx, run in enumerate(sorted_runs, start=1):
+        final_metrics = run.get("final_metrics", {})
+        val_acc = _as_float(final_metrics.get("val_acc"))
+        val_loss = _as_float(final_metrics.get("val_loss"))
+        train_loss = _as_float(final_metrics.get("train_loss"))
+
+        def _format_metric(metric: Any, pct: bool = False) -> str:
+            if metric is None:
+                return "n/a"
+            return f"{metric:.2%}" if pct else f"{metric:.4f}"
+
+        layer_code = run.get("generated_layers", "").strip()
+        single_line_layers = " ".join(layer_code.split())
+        if len(single_line_layers) > 200:
+            single_line_layers = f"{single_line_layers[:197]}..."
+
+        summary_lines.append(
+            (
+                f"Run {idx}: val_acc={_format_metric(val_acc, pct=True)}, "
+                f"val_loss={_format_metric(val_loss)}, train_loss={_format_metric(train_loss)}, "
+                f"layers={single_line_layers}"
+            )
+        )
+
+    return "\n".join(summary_lines)
+
+
 def _call_openai_chat(messages: List[Dict[str, str]], model_name: str, api_key: str) -> str:
     """Send a chat request to OpenAI, supporting both legacy and responses APIs."""
     if openai is None:
@@ -96,6 +167,20 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY environment variable is not set; unable to contact ChatGPT.")
 
+    log_path = Path(getattr(cfg, "results_log_path", "training_runs.jsonl")).expanduser()
+    previous_runs = _load_recent_training_runs(log_path, limit=5)
+    prior_summary = _summarize_runs_for_prompt(previous_runs)
+    if prior_summary:
+        history_context = (
+            "Recent training history (best first):\n"
+            f"{prior_summary}\n\n"
+            "Blend the strengths of higher-performing runs and address weaknesses where accuracy and loss stalled."
+        )
+    else:
+        history_context = (
+            "No previous training runs were found. Choose a reasonable architecture for the task."
+        )
+
     layer_catalog = json.dumps(available_layers, indent=2)
     messages: List[Dict[str, str]] = [
         {
@@ -110,9 +195,12 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
             "content": (
                 "Here is the list of available torch.nn layers and their constructor"
                 f" details:\n{layer_catalog}\n\n"
+                f"{history_context}\n"
                 "Using only these building blocks, craft a PyTorch `nn.Sequential` suitable"
-                f" for a classifier with input_dim={cfg.input_dim}, hidden_dim={cfg.hidden_dim},"
-                f" and num_classes={cfg.num_classes}. Only respond with the Python assignment"
+                f" for a classifier that accepts inputs of dimension {cfg.input_dim} and outputs"
+                f" {cfg.num_classes} logits. Explore different depths and hidden widths when"
+                " prior performance plateaus, but ensure the final module produces the correct"
+                " number of class scores. Only respond with the Python assignment"
                 " statement `self.layers = ...` and nothing else. Do not include code fences."
             ),
         },
@@ -168,7 +256,13 @@ class GPTTrainer:
     """
     Utility class for training and evaluating a SimpleClassifier.
     """
-    def __init__(self, cfg: Config, xs: torch.Tensor, ys: torch.Tensor, results_log_path: str = "training_runs.jsonl") -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        xs: torch.Tensor,
+        ys: torch.Tensor,
+        results_log_path: Optional[str] = None,
+    ) -> None:
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.model = SimpleClassifier(cfg).to(self.device)
@@ -177,7 +271,8 @@ class GPTTrainer:
         self.training_history: List[Dict[str, Any]] = []
         self.training_runs: List[Dict[str, Any]] = []
         self.latest_results: Dict[str, Any] = {}
-        self.results_log_path = Path(results_log_path)
+        resolved_log_path = results_log_path or getattr(cfg, "results_log_path", "training_runs.jsonl")
+        self.results_log_path = Path(resolved_log_path).expanduser()
 
         train_ds, val_ds = self.split_dataset(xs, ys, cfg.train_split)
         self.train_loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
