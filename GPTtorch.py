@@ -55,6 +55,11 @@ def _format_for_responses(messages: List[Dict[str, str]]) -> List[Dict[str, Any]
     ]
 
 
+def _normalize_assignment(text: str) -> str:
+    """Collapse whitespace so layer assignments can be compared reliably."""
+    return " ".join(text.split())
+
+
 def _load_recent_training_runs(log_path: Path, limit: int = 5) -> List[Dict[str, Any]]:
     """Read the most recent training run records from a JSONL log file."""
     if limit <= 0:
@@ -170,6 +175,15 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
     log_path = Path(getattr(cfg, "results_log_path", "training_runs.jsonl")).expanduser()
     previous_runs = _load_recent_training_runs(log_path, limit=5)
     prior_summary = _summarize_runs_for_prompt(previous_runs)
+    used_assignments: List[str] = []
+    seen_assignments = set()
+    for run in previous_runs:
+        assignment = _normalize_assignment(run.get("generated_layers", ""))
+        if not assignment or assignment in seen_assignments:
+            continue
+        seen_assignments.add(assignment)
+        used_assignments.append(assignment)
+
     if prior_summary:
         history_context = (
             "Recent training history (best first):\n"
@@ -181,7 +195,35 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
             "No previous training runs were found. Choose a reasonable architecture for the task."
         )
 
+    if used_assignments:
+        assignment_lines = []
+        for idx, assignment in enumerate(used_assignments, start=1):
+            truncated = assignment
+            if len(truncated) > 200:
+                truncated = f"{truncated[:197]}..."
+            assignment_lines.append(f"{idx}. {truncated}")
+        prior_assignments_context = (
+            "Previously used layer assignments (avoid exact repeats):\n"
+            + "\n".join(assignment_lines)
+            + "\n"
+        )
+    else:
+        prior_assignments_context = ""
+
     layer_catalog = json.dumps(available_layers, indent=2)
+    base_user_content = (
+        "Here is the list of available torch.nn layers and their constructor"
+        f" details:\n{layer_catalog}\n\n"
+        f"{history_context}\n"
+        f"{prior_assignments_context}"
+        "Using only these building blocks, craft a PyTorch `nn.Sequential` suitable"
+        f" for a classifier that accepts inputs of dimension {cfg.input_dim} and outputs"
+        f" {cfg.num_classes} logits. Explore different depths and hidden widths when"
+        " prior performance plateaus, but ensure the final module produces the correct"
+        " number of class scores. Only respond with the Python assignment"
+        " statement `self.layers = ...` and nothing else. Do not include code fences."
+    )
+
     messages: List[Dict[str, str]] = [
         {
             "role": "system",
@@ -192,21 +234,37 @@ def generate_layers(cfg: Config, model_name: str = "gpt-4o-mini") -> str:
         },
         {
             "role": "user",
-            "content": (
-                "Here is the list of available torch.nn layers and their constructor"
-                f" details:\n{layer_catalog}\n\n"
-                f"{history_context}\n"
-                "Using only these building blocks, craft a PyTorch `nn.Sequential` suitable"
-                f" for a classifier that accepts inputs of dimension {cfg.input_dim} and outputs"
-                f" {cfg.num_classes} logits. Explore different depths and hidden widths when"
-                " prior performance plateaus, but ensure the final module produces the correct"
-                " number of class scores. Only respond with the Python assignment"
-                " statement `self.layers = ...` and nothing else. Do not include code fences."
-            ),
+            "content": base_user_content,
         },
     ]
-    response = _call_openai_chat(messages, model_name, api_key)
-    return _strip_code_fences(response)
+
+    max_attempts = 3
+    normalized = ""
+    for attempt in range(1, max_attempts + 1):
+        response = _call_openai_chat(messages, model_name, api_key)
+        cleaned = _strip_code_fences(response)
+        normalized = _normalize_assignment(cleaned)
+
+        if normalized and normalized not in seen_assignments:
+            return cleaned
+
+        messages.append({"role": "assistant", "content": cleaned})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "We have already used that exact configuration. Please return"
+                    " a different layer assignment that is not identical to any"
+                    " previously listed."
+                ),
+            }
+        )
+
+    if normalized:
+        raise RuntimeError(
+            "generate_layers failed to produce a novel architecture after multiple attempts."
+        )
+    raise RuntimeError("generate_layers returned an empty layer assignment.")
 
 # Cache available layers for use in generate_layers
 available_layers = list_available_layers()
