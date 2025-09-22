@@ -11,11 +11,15 @@ def main() -> None:
 
 
     # final testing
-    sample = torch.tensor([[2.5, 0.0], [0.0, -4.0]])
-    probs = trainer.predict(sample)
-    print("\nSample predictions:")
-    for point, prob in zip(sample, probs):
-        print(f"  point={point.tolist()} -> class_1_prob={prob[1]:.2%}")
+    val_xs, val_ys = trainer.val_loader.dataset.tensors
+    probs = trainer.predict(val_xs)
+    preds = torch.argmax(probs, dim=1)
+    print("\nValidation predictions:")
+    for target, pred, prob in zip(val_ys, preds, probs):
+        confidence = prob[pred].item()
+        print(
+            f"  label={target.item()} predicted={pred.item()} confidence={confidence:.2f}"
+        )
 
 if __name__ == "__main__":
     main()

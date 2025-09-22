@@ -460,6 +460,7 @@ class GPTTrainer:
         )
 
         self.device = torch.device(device)
+        self.input_dim = int(input_dim)
         self.model_name = model_name
         self.criterion = nn.CrossEntropyLoss()
 
@@ -560,6 +561,12 @@ class GPTTrainer:
         """Predict class probabilities for a sample batch."""
         if self.model is None:
             raise RuntimeError("Call `fit` before `predict`; the model has not been initialized.")
+        if sample.ndim != 2:
+            raise ValueError("`sample` must be a 2D tensor shaped [batch, num_features].")
+        if sample.shape[1] != self.input_dim:
+            raise ValueError(
+                f"`sample` has {sample.shape[1]} features, but the model expects {self.input_dim}."
+            )
         with torch.no_grad():
             logits = self.model(sample.to(self.device))
             probs = torch.softmax(logits, dim=1)
