@@ -69,13 +69,17 @@ def _split_generated_assignments(
     Optional[str],
     Optional[str],
     Optional[str],
+    Optional[str],
+    Optional[str],
 ]:
-    """Extract layer, optimizer, epoch, scheduler, loss, and stop assignments."""
+    """Extract layer, optimizer, epoch, scheduler, loss, stop, and early-stop assignments."""
     optimizer_prefix = "self.optimizer ="
     epochs_prefix = "self.training_epochs ="
     scheduler_prefix = "self.scheduler ="
     loss_prefix = "self.loss ="
     stop_prefix = "self.stop_training ="
+    patience_prefix = "self.early_stop_patience ="
+    min_delta_prefix = "self.early_stop_min_delta ="
     lines = [line.strip() for line in assignments.splitlines() if line.strip()]
     layer_lines: List[str] = []
     optimizer_line: Optional[str] = None
@@ -83,6 +87,8 @@ def _split_generated_assignments(
     scheduler_line: Optional[str] = None
     loss_line: Optional[str] = None
     stop_line: Optional[str] = None
+    patience_line: Optional[str] = None
+    min_delta_line: Optional[str] = None
     for line in lines:
         if line.startswith(optimizer_prefix):
             optimizer_line = line
@@ -94,6 +100,10 @@ def _split_generated_assignments(
             loss_line = line
         elif line.startswith(stop_prefix):
             stop_line = line
+        elif line.startswith(patience_prefix):
+            patience_line = line
+        elif line.startswith(min_delta_prefix):
+            min_delta_line = line
         else:
             layer_lines.append(line)
     return (
@@ -103,6 +113,8 @@ def _split_generated_assignments(
         scheduler_line,
         loss_line,
         stop_line,
+        patience_line,
+        min_delta_line,
     )
 
 
@@ -349,7 +361,7 @@ def generate_layers(
     used_assignments: List[str] = []
     seen_assignments = set()
     for run in previous_runs:
-        layers_code, _, _, _, _, _ = _split_generated_assignments(run.get("generated_layers", ""))
+        layers_code, *_ = _split_generated_assignments(run.get("generated_layers", ""))
         assignment = _normalize_assignment(layers_code)
         if not assignment or assignment in seen_assignments:
             continue
@@ -422,18 +434,19 @@ def generate_layers(
         " explaining how it satisfies the current adaptation stage and confirms the two-logit output."
         "When a plateau has occurred, also switch the optimizer schedule to"
         " `torch.optim.lr_scheduler.CosineAnnealingLR` or `torch.optim.lr_scheduler.OneCycleLR` for the next run."
-        " Base training budget should target 90–100 epochs with patience-based early stopping (patience 10, min_delta 0.002)."
+        " Choose context-aware settings and emit `self.early_stop_patience = <int>`"
+        " and `self.early_stop_min_delta = <float>` (within [0.0005, 0.01]) so later code can hydrate these values."
         "Also choose optimizer, learning-rate, batch size, weight decay, scheduler, and seed values that honour the exploration policy"
         " above, referencing `self.model.parameters()` (or `self.parameters()`)."
-        "Finally, emit concise inline Python comments after the optimizer and epoch (and scheduler/loss if provided) assignments"
-        " summarising how these hyperparameters differ from the prior best configuration."
+        "Finally, emit concise inline Python comments after the optimizer, epoch, early stopping,"
+        " and scheduler/loss assignments summarising how these choices differ from the prior best configuration."
         " Format `self.layers` so each module appears on its own line inside `nn.Sequential`, with trailing commas where needed,"
         " and place comments after the code they describe—never immediately after an opening parenthesis."
         " Reflect explicitly on whether the existing trajectory already represents the most optimal result we can achieve."
         " Encode that verdict as a boolean assignment `self.stop_training = <True|False>` with an inline comment"
         " answering the question \"Have we reached optimal results such that further model/hyperparameter changes would not help?\""
         " Use `True` only when you are confident further exploration is unlikely to help; otherwise emit `False`."
-        " Respond with at least three Python assignments on separate lines in the order required by the system instruction."
+        " Respond with each required Python assignment on separate lines in the order specified by the system instruction."
         "Do not include code fences or extra narration."
     )
 
@@ -441,11 +454,11 @@ def generate_layers(
         {
             "role": "system",
             "content": (
-                "You write concise Python for PyTorch modules. Respond with at least three "
-                "assignments in this order: `self.layers = ...`, `self.optimizer = ...`, "
-                "`self.training_epochs = ...`. Optional `self.scheduler = ...` and "
-                "`self.loss = ...` assignments may follow if needed, and finish with"
-                " a boolean verdict `self.stop_training = ...`."
+                "You write concise Python for PyTorch modules. Respond with assignments in this exact order: "
+                "`self.layers = ...`, `self.optimizer = ...`, `self.training_epochs = ...`, "
+                "`self.early_stop_patience = ...`, `self.early_stop_min_delta = ...`. Optional "
+                "`self.scheduler = ...` and `self.loss = ...` assignments may follow afterward, and finish with "
+                "a boolean verdict `self.stop_training = ...`."
             ),
         },
         {
@@ -478,6 +491,8 @@ def generate_layers(
             scheduler_part,
             loss_part,
             stop_part,
+            patience_part,
+            min_delta_part,
         ) = _split_generated_assignments(cleaned)
         normalized = _normalize_assignment(layers_part)
 
@@ -534,6 +549,32 @@ def generate_layers(
             )
             continue
 
+        if not patience_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Add an early stopping patience line in the form "
+                        "`self.early_stop_patience = <positive integer>` with an inline summary."
+                    ),
+                }
+            )
+            continue
+
+        if not min_delta_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Include an early stopping delta line `self.early_stop_min_delta = <positive float>` "
+                        "with a brief inline rationale."
+                    ),
+                }
+            )
+            continue
+
         if not stop_part:
             messages.append({"role": "assistant", "content": cleaned})
             messages.append(
@@ -547,7 +588,7 @@ def generate_layers(
             )
             continue
 
-        ordered_parts = [layers_part, optimizer_part, epochs_part]
+        ordered_parts = [layers_part, optimizer_part, epochs_part, patience_part, min_delta_part]
         if scheduler_part:
             ordered_parts.append(scheduler_part)
         if loss_part:
@@ -597,6 +638,8 @@ class SimpleClassifier(nn.Module):
             scheduler_code,
             loss_code,
             stop_code,
+            patience_code,
+            min_delta_code,
         ) = _split_generated_assignments(generated_layers)
 
         # Keep a copy so training summaries can reference the generated architecture
@@ -606,6 +649,8 @@ class SimpleClassifier(nn.Module):
         self.generated_scheduler_code = scheduler_code or ""
         self.generated_loss_code = loss_code or ""
         self.generated_stop_code = stop_code or ""
+        self.generated_patience_code = patience_code or ""
+        self.generated_min_delta_code = min_delta_code or ""
 
         if layer_code and "self.layers" in layer_code:
             try:
@@ -676,6 +721,8 @@ class GPTTrainer:
             scheduler=None,
             pos_weight=None,
             loss=None,
+            early_stop_patience=None,
+            early_stop_min_delta=None,
         )
 
         self.device = torch.device(device)
@@ -701,6 +748,8 @@ class GPTTrainer:
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.scheduler: Optional[Any] = None
         self.epochs = 0
+        self.early_stop_patience = 12
+        self.early_stop_min_delta = 0.002
 
         self.training_history: List[Dict[str, Any]] = []
         self.training_runs: List[Dict[str, Any]] = []
@@ -881,8 +930,8 @@ class GPTTrainer:
                     )
                 break
 
-            patience = 12
-            min_delta = 0.002
+            patience = int(self.early_stop_patience)
+            min_delta = float(self.early_stop_min_delta)
             stalled = 0
             best_val_loss = float("inf")
             best_val_acc = 0.0
@@ -957,6 +1006,8 @@ class GPTTrainer:
                 "final_metrics": final_metrics,
                 "patience": patience,
                 "min_delta": min_delta,
+                "patience_code": getattr(self.model, "generated_patience_code", ""),
+                "min_delta_code": getattr(self.model, "generated_min_delta_code", ""),
                 "stopped_early": stalled >= patience,
                 "scheduler": self.scheduler.__class__.__name__ if self.scheduler else None,
                 "seed": self._model_context.seed,
@@ -980,6 +1031,10 @@ class GPTTrainer:
                         "scheduler": getattr(self.model, "generated_scheduler_code", ""),
                         "loss": getattr(self.model, "generated_loss_code", ""),
                         "stop_code": getattr(self.model, "generated_stop_code", ""),
+                        "patience_code": getattr(self.model, "generated_patience_code", ""),
+                        "min_delta_code": getattr(self.model, "generated_min_delta_code", ""),
+                        "patience": patience,
+                        "min_delta": min_delta,
                         "final_metrics": final_metrics,
                         "iteration": iteration + 1,
                         "input_dim": self.input_dim,
@@ -1014,11 +1069,15 @@ class GPTTrainer:
         self.optimizer = None
         self.scheduler = None
         self.epochs = 0
+        self.early_stop_patience = 12
+        self.early_stop_min_delta = 0.002
 
         for attempt in range(1, max_attempts + 1):
             self._model_context.learning_rate = None
             self._model_context.scheduler = None
             self._model_context.epochs = None
+            self._model_context.early_stop_patience = None
+            self._model_context.early_stop_min_delta = None
 
             try:
                 model = SimpleClassifier(
@@ -1044,6 +1103,8 @@ class GPTTrainer:
                 scheduler_assignment,
                 loss_assignment,
                 stop_assignment,
+                patience_assignment,
+                min_delta_assignment,
             ) = _split_generated_assignments(
                 getattr(model, "generated_layers_code", "")
             )
@@ -1111,6 +1172,39 @@ class GPTTrainer:
                     self._model_context.learning_rate = float(lr_value)
             else:
                 self._model_context.learning_rate = None
+
+            try:
+                patience_value = self._resolve_early_stop_patience(patience_assignment)
+            except RuntimeError as exc:
+                command = (patience_assignment or "<missing early stop patience>").strip()
+                error_text = str(exc)
+                last_error = f"Early stop patience command `{command}` failed: {error_text}"
+                feedback = last_error
+                print(
+                    f"Regenerating architecture (attempt {attempt}/{max_attempts}) after failure: {error_text}"
+                )
+                self.model = None
+                self.optimizer = None
+                continue
+
+            try:
+                min_delta_value = self._resolve_early_stop_min_delta(min_delta_assignment)
+            except RuntimeError as exc:
+                command = (min_delta_assignment or "<missing early stop min_delta>").strip()
+                error_text = str(exc)
+                last_error = f"Early stop min_delta command `{command}` failed: {error_text}"
+                feedback = last_error
+                print(
+                    f"Regenerating architecture (attempt {attempt}/{max_attempts}) after failure: {error_text}"
+                )
+                self.model = None
+                self.optimizer = None
+                continue
+
+            self.early_stop_patience = patience_value
+            self.early_stop_min_delta = min_delta_value
+            self._model_context.early_stop_patience = patience_value
+            self._model_context.early_stop_min_delta = min_delta_value
 
             try:
                 self.scheduler = self._build_scheduler(scheduler_assignment)
@@ -1290,6 +1384,70 @@ class GPTTrainer:
         resolved = int(value)
         if resolved <= 0:
             raise RuntimeError("Generated training epochs must be a positive integer.")
+
+        return resolved
+
+    def _resolve_early_stop_patience(self, command: Optional[str]) -> int:
+        if not command:
+            raise RuntimeError("Generated response omitted an early stop patience assignment.")
+
+        try:
+            class _PatienceContext:
+                def __init__(self) -> None:
+                    self.early_stop_patience: Optional[Any] = None
+
+            context = _PatienceContext()
+            exec(command, {"cfg": self._model_context}, {"self": context})
+            value = getattr(context, "early_stop_patience", None)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Generated early stop patience command failed with error: {exc}"
+            ) from exc
+
+        if value is None:
+            raise RuntimeError(
+                "Generated early stop patience command did not assign `self.early_stop_patience`."
+            )
+
+        resolved = int(value)
+        if resolved <= 0:
+            raise RuntimeError("Early stop patience must be a positive integer.")
+        if resolved > 500:
+            raise RuntimeError("Early stop patience must be <= 500 epochs.")
+
+        return resolved
+
+    def _resolve_early_stop_min_delta(self, command: Optional[str]) -> float:
+        if not command:
+            raise RuntimeError("Generated response omitted an early stop min_delta assignment.")
+
+        try:
+            class _DeltaContext:
+                def __init__(self) -> None:
+                    self.early_stop_min_delta: Optional[Any] = None
+
+            context = _DeltaContext()
+            exec(command, {"cfg": self._model_context}, {"self": context})
+            value = getattr(context, "early_stop_min_delta", None)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Generated early stop min_delta command failed with error: {exc}"
+            ) from exc
+
+        if value is None:
+            raise RuntimeError(
+                "Generated early stop min_delta command did not assign `self.early_stop_min_delta`."
+            )
+
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Early stop min_delta must be a numeric value.") from exc
+
+        if resolved <= 0.0:
+            raise RuntimeError("Early stop min_delta must be greater than zero.")
+        if resolved >= 1.0:
+            raise RuntimeError("Early stop min_delta must be less than 1.0.")
 
         return resolved
 
