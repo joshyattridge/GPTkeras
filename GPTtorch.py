@@ -2,6 +2,7 @@
 import os
 import json
 import inspect
+from numbers import Integral
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -759,94 +760,107 @@ class GPTTrainer:
         accuracy = correct / len(self.val_loader.dataset)
         return avg_loss, accuracy
 
-    def fit(self) -> None:
-        """Train for the configured number of epochs, printing progress."""
-        self._initialize_training_components()
+    def fit(self, *, max_iterations: Optional[int] = None) -> None:
+        """Train for the configured number of epochs, optionally repeating multiple runs."""
+        if max_iterations is None:
+            iterations = 1
+        else:
+            if isinstance(max_iterations, bool) or not isinstance(max_iterations, Integral):
+                raise TypeError("`max_iterations` must be an integer.")
+            iterations = int(max_iterations)
+            if iterations <= 0:
+                raise ValueError("`max_iterations` must be a positive integer.")
 
-        patience = 12
-        min_delta = 0.002
-        stalled = 0
-        best_val_loss = float("inf")
-        best_val_acc = 0.0
-        best_train_loss = float("inf")
-        best_epoch = 0
-        best_state: Optional[Dict[str, torch.Tensor]] = None
+        for iteration in range(iterations):
+            if iterations > 1:
+                print(f"Starting training iteration {iteration + 1}/{iterations}")
 
-        history: List[Dict[str, Any]] = []
+            self._initialize_training_components()
 
-        for epoch in range(1, self.epochs + 1):
-            train_loss = self.train()
-            val_loss, val_acc = self.evaluate()
+            patience = 12
+            min_delta = 0.002
+            stalled = 0
+            best_val_loss = float("inf")
+            best_val_acc = 0.0
+            best_train_loss = float("inf")
+            best_epoch = 0
+            best_state: Optional[Dict[str, torch.Tensor]] = None
 
-            if self.scheduler is not None:
-                try:
-                    self.scheduler.step(val_loss)
-                except TypeError:
-                    self.scheduler.step()
+            history: List[Dict[str, Any]] = []
 
-            print(
-                f"Epoch {epoch}/{self.epochs} | Train loss: {train_loss:.3f} "
-                f"| Val loss: {val_loss:.3f} | Val accuracy: {val_acc:.2%}"
-            )
+            for epoch in range(1, self.epochs + 1):
+                train_loss = self.train()
+                val_loss, val_acc = self.evaluate()
 
-            history.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": float(train_loss),
-                    "val_loss": float(val_loss),
-                    "val_acc": float(val_acc),
-                }
-            )
+                if self.scheduler is not None:
+                    try:
+                        self.scheduler.step(val_loss)
+                    except TypeError:
+                        self.scheduler.step()
 
-            improved = (val_loss < (best_val_loss - min_delta)) or (
-                abs(val_loss - best_val_loss) <= min_delta and val_acc > best_val_acc
-            )
-
-            if improved or best_state is None:
-                best_val_loss = float(val_loss)
-                best_val_acc = float(val_acc)
-                best_train_loss = float(train_loss)
-                best_epoch = epoch
-                stalled = 0
-                best_state = {
-                    key: value.detach().cpu().clone()
-                    for key, value in self.model.state_dict().items()
-                }
-            else:
-                stalled += 1
-
-            if stalled >= patience:
                 print(
-                    f"Early stopping at epoch {epoch}: no val_loss improvement >={min_delta:.3f}"
-                    f" for {patience} checks."
+                    f"Epoch {epoch}/{self.epochs} | Train loss: {train_loss:.3f} "
+                    f"| Val loss: {val_loss:.3f} | Val accuracy: {val_acc:.2%}"
                 )
-                break
 
-        if best_state is not None:
-            self.model.load_state_dict(best_state)
+                history.append(
+                    {
+                        "epoch": epoch,
+                        "train_loss": float(train_loss),
+                        "val_loss": float(val_loss),
+                        "val_acc": float(val_acc),
+                    }
+                )
 
-        history_copy = [dict(record) for record in history]
-        final_metrics = {
-            "best_epoch": int(best_epoch),
-            "epochs_trained": len(history_copy),
-            "train_loss": float(best_train_loss),
-            "val_loss": float(best_val_loss),
-            "val_acc": float(best_val_acc),
-        }
-        run_record = {
-            "generated_layers": getattr(self.model, "generated_layers_code", ""),
-            "history": history_copy,
-            "final_metrics": final_metrics,
-            "patience": patience,
-            "min_delta": min_delta,
-            "stopped_early": stalled >= patience,
-            "scheduler": self.scheduler.__class__.__name__ if self.scheduler else None,
-            "seed": self._model_context.seed,
-        }
-        self.training_history = history_copy
-        self.latest_results = run_record
-        self.training_runs.append(run_record)
-        self._append_run_to_log(run_record)
+                improved = (val_loss < (best_val_loss - min_delta)) or (
+                    abs(val_loss - best_val_loss) <= min_delta and val_acc > best_val_acc
+                )
+
+                if improved or best_state is None:
+                    best_val_loss = float(val_loss)
+                    best_val_acc = float(val_acc)
+                    best_train_loss = float(train_loss)
+                    best_epoch = epoch
+                    stalled = 0
+                    best_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in self.model.state_dict().items()
+                    }
+                else:
+                    stalled += 1
+
+                if stalled >= patience:
+                    print(
+                        f"Early stopping at epoch {epoch}: no val_loss improvement >={min_delta:.3f}"
+                        f" for {patience} checks."
+                    )
+                    break
+
+            if best_state is not None:
+                self.model.load_state_dict(best_state)
+
+            history_copy = [dict(record) for record in history]
+            final_metrics = {
+                "best_epoch": int(best_epoch),
+                "epochs_trained": len(history_copy),
+                "train_loss": float(best_train_loss),
+                "val_loss": float(best_val_loss),
+                "val_acc": float(best_val_acc),
+            }
+            run_record = {
+                "generated_layers": getattr(self.model, "generated_layers_code", ""),
+                "history": history_copy,
+                "final_metrics": final_metrics,
+                "patience": patience,
+                "min_delta": min_delta,
+                "stopped_early": stalled >= patience,
+                "scheduler": self.scheduler.__class__.__name__ if self.scheduler else None,
+                "seed": self._model_context.seed,
+            }
+            self.training_history = history_copy
+            self.latest_results = run_record
+            self.training_runs.append(run_record)
+            self._append_run_to_log(run_record)
 
     def predict(self, sample: torch.Tensor) -> torch.Tensor:
         """Predict class probabilities for a sample batch."""
