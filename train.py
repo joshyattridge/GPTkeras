@@ -7,7 +7,7 @@ def main() -> None:
     xs, ys = make_toy_dataset()
     trainer = GPTTrainer(xs, ys)
 
-    trainer.fit(max_iterations=10)
+    trainer.fit(max_iterations=100)
 
 if __name__ == "__main__":
     main()

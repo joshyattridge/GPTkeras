@@ -2,6 +2,7 @@
 import os
 import json
 import inspect
+import re
 from numbers import Integral
 from collections import deque
 from pathlib import Path
@@ -61,18 +62,27 @@ def _normalize_assignment(text: str) -> str:
 
 def _split_generated_assignments(
     assignments: str,
-) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Extract layer, optimizer, epoch, scheduler, and loss assignments."""
+) -> Tuple[
+    str,
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    """Extract layer, optimizer, epoch, scheduler, loss, and stop assignments."""
     optimizer_prefix = "self.optimizer ="
     epochs_prefix = "self.training_epochs ="
     scheduler_prefix = "self.scheduler ="
     loss_prefix = "self.loss ="
+    stop_prefix = "self.stop_training ="
     lines = [line.strip() for line in assignments.splitlines() if line.strip()]
     layer_lines: List[str] = []
     optimizer_line: Optional[str] = None
     epochs_line: Optional[str] = None
     scheduler_line: Optional[str] = None
     loss_line: Optional[str] = None
+    stop_line: Optional[str] = None
     for line in lines:
         if line.startswith(optimizer_prefix):
             optimizer_line = line
@@ -82,9 +92,59 @@ def _split_generated_assignments(
             scheduler_line = line
         elif line.startswith(loss_prefix):
             loss_line = line
+        elif line.startswith(stop_prefix):
+            stop_line = line
         else:
             layer_lines.append(line)
-    return "\n".join(layer_lines), optimizer_line, epochs_line, scheduler_line, loss_line
+    return (
+        "\n".join(layer_lines),
+        optimizer_line,
+        epochs_line,
+        scheduler_line,
+        loss_line,
+        stop_line,
+    )
+
+
+def _repair_inline_comments(block: str) -> str:
+    """Relocate inline comments so they do not consume subsequent code tokens."""
+    lines = block.splitlines()
+    fixed_lines: List[str] = []
+
+    for line in lines:
+        if "#" not in line:
+            fixed_lines.append(line)
+            continue
+
+        before, comment_tail = line.split("#", 1)
+        prefix = before.rstrip()
+        indent_match = re.match(r"(\s*)", before)
+        indent = indent_match.group(1) if indent_match else ""
+
+        comment_tail = comment_tail.rstrip()
+        remainder = ""
+        for marker in ("nn.", "torch.", "self.", "cfg."):
+            marker_index = comment_tail.find(marker)
+            if marker_index != -1:
+                remainder = comment_tail[marker_index:].strip()
+                comment_tail = comment_tail[:marker_index].strip()
+                break
+        else:
+            comment_tail = comment_tail.strip()
+
+        if prefix:
+            if comment_tail:
+                fixed_lines.append(f"{prefix}  # {comment_tail}")
+            else:
+                fixed_lines.append(prefix)
+        elif comment_tail:
+            fixed_lines.append(f"{indent}# {comment_tail}")
+
+        if remainder:
+            rest_line = f"{indent}    {remainder}"
+            fixed_lines.append(rest_line)
+
+    return "\n".join(fixed_lines)
 
 
 def _load_recent_training_runs(log_path: Path, limit: int = 50) -> List[Dict[str, Any]]:
@@ -289,7 +349,7 @@ def generate_layers(
     used_assignments: List[str] = []
     seen_assignments = set()
     for run in previous_runs:
-        layers_code, _, _, _, _ = _split_generated_assignments(run.get("generated_layers", ""))
+        layers_code, _, _, _, _, _ = _split_generated_assignments(run.get("generated_layers", ""))
         assignment = _normalize_assignment(layers_code)
         if not assignment or assignment in seen_assignments:
             continue
@@ -367,6 +427,12 @@ def generate_layers(
         " above, referencing `self.model.parameters()` (or `self.parameters()`)."
         "Finally, emit concise inline Python comments after the optimizer and epoch (and scheduler/loss if provided) assignments"
         " summarising how these hyperparameters differ from the prior best configuration."
+        " Format `self.layers` so each module appears on its own line inside `nn.Sequential`, with trailing commas where needed,"
+        " and place comments after the code they describe—never immediately after an opening parenthesis."
+        " Reflect explicitly on whether the existing trajectory already represents the most optimal result we can achieve."
+        " Encode that verdict as a boolean assignment `self.stop_training = <True|False>` with an inline comment"
+        " answering the question \"Have we reached optimal results such that further model/hyperparameter changes would not help?\""
+        " Use `True` only when you are confident further exploration is unlikely to help; otherwise emit `False`."
         " Respond with at least three Python assignments on separate lines in the order required by the system instruction."
         "Do not include code fences or extra narration."
     )
@@ -378,7 +444,8 @@ def generate_layers(
                 "You write concise Python for PyTorch modules. Respond with at least three "
                 "assignments in this order: `self.layers = ...`, `self.optimizer = ...`, "
                 "`self.training_epochs = ...`. Optional `self.scheduler = ...` and "
-                "`self.loss = ...` assignments may follow if needed."
+                "`self.loss = ...` assignments may follow if needed, and finish with"
+                " a boolean verdict `self.stop_training = ...`."
             ),
         },
         {
@@ -410,6 +477,7 @@ def generate_layers(
             epochs_part,
             scheduler_part,
             loss_part,
+            stop_part,
         ) = _split_generated_assignments(cleaned)
         normalized = _normalize_assignment(layers_part)
 
@@ -466,11 +534,25 @@ def generate_layers(
             )
             continue
 
+        if not stop_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Add a boolean verdict `self.stop_training = ...` with an inline comment"
+                        " indicating whether to halt further exploration." 
+                    ),
+                }
+            )
+            continue
+
         ordered_parts = [layers_part, optimizer_part, epochs_part]
         if scheduler_part:
             ordered_parts.append(scheduler_part)
         if loss_part:
             ordered_parts.append(loss_part)
+        ordered_parts.append(stop_part)
 
         return "\n".join([part for part in ordered_parts if part])
 
@@ -514,6 +596,7 @@ class SimpleClassifier(nn.Module):
             epochs_code,
             scheduler_code,
             loss_code,
+            stop_code,
         ) = _split_generated_assignments(generated_layers)
 
         # Keep a copy so training summaries can reference the generated architecture
@@ -522,9 +605,11 @@ class SimpleClassifier(nn.Module):
         self.generated_epochs_code = epochs_code or ""
         self.generated_scheduler_code = scheduler_code or ""
         self.generated_loss_code = loss_code or ""
+        self.generated_stop_code = stop_code or ""
 
         if layer_code and "self.layers" in layer_code:
             try:
+                layer_code = _repair_inline_comments(layer_code)
                 exec(
                     layer_code,
                     {"nn": nn, "torch": torch, "cfg": cfg},
@@ -621,6 +706,10 @@ class GPTTrainer:
         self.training_runs: List[Dict[str, Any]] = []
         self.latest_results: Dict[str, Any] = {}
         self.results_log_path = Path(log_path_value).expanduser()
+        self.stop_requested = False
+        self.stop_verdict_code = ""
+        self.best_model_bundle: Optional[Dict[str, Any]] = None
+        self._best_val_acc: float = float("-inf")
 
         train_ds, val_ds = self.split_dataset(
             xs,
@@ -777,6 +866,21 @@ class GPTTrainer:
 
             self._initialize_training_components()
 
+            if self.stop_requested:
+                saved_path = self._save_best_model()
+                verdict = (self.stop_verdict_code or "self.stop_training = True").strip()
+                if saved_path is not None:
+                    print(
+                        f"ChatGPT recommended stopping further training ({verdict}). "
+                        f"Saved best model to {saved_path}."
+                    )
+                else:
+                    print(
+                        f"ChatGPT recommended stopping further training ({verdict}), "
+                        "but no trained model was available to save."
+                    )
+                break
+
             patience = 12
             min_delta = 0.002
             stalled = 0
@@ -857,10 +961,31 @@ class GPTTrainer:
                 "scheduler": self.scheduler.__class__.__name__ if self.scheduler else None,
                 "seed": self._model_context.seed,
             }
+            run_record["stop_code"] = getattr(self.model, "generated_stop_code", "")
             self.training_history = history_copy
             self.latest_results = run_record
             self.training_runs.append(run_record)
             self._append_run_to_log(run_record)
+
+            if best_state is not None:
+                val_acc_score = float(final_metrics.get("val_acc", float("-inf")))
+                if val_acc_score >= self._best_val_acc:
+                    self._best_val_acc = val_acc_score
+                    state_copy = {key: tensor.clone() for key, tensor in best_state.items()}
+                    self.best_model_bundle = {
+                        "state_dict": state_copy,
+                        "generated_layers": getattr(self.model, "generated_layers_code", ""),
+                        "optimizer": getattr(self.model, "generated_optimizer_code", ""),
+                        "epochs_assignment": getattr(self.model, "generated_epochs_code", ""),
+                        "scheduler": getattr(self.model, "generated_scheduler_code", ""),
+                        "loss": getattr(self.model, "generated_loss_code", ""),
+                        "stop_code": getattr(self.model, "generated_stop_code", ""),
+                        "final_metrics": final_metrics,
+                        "iteration": iteration + 1,
+                        "input_dim": self.input_dim,
+                        "num_classes": self._model_context.num_classes,
+                        "train_split": self._model_context.train_split,
+                    }
 
     def predict(self, sample: torch.Tensor) -> torch.Tensor:
         """Predict class probabilities for a sample batch."""
@@ -883,6 +1008,8 @@ class GPTTrainer:
         feedback: Optional[str] = None
         last_error: Optional[str] = None
 
+        self.stop_requested = False
+        self.stop_verdict_code = ""
         self.model = None
         self.optimizer = None
         self.scheduler = None
@@ -916,9 +1043,31 @@ class GPTTrainer:
                 epochs_assignment,
                 scheduler_assignment,
                 loss_assignment,
+                stop_assignment,
             ) = _split_generated_assignments(
                 getattr(model, "generated_layers_code", "")
             )
+
+            self.stop_verdict_code = stop_assignment or ""
+
+            try:
+                should_stop = self._resolve_stop_signal(stop_assignment)
+            except RuntimeError as exc:
+                last_error = str(exc)
+                feedback = last_error
+                print(
+                    f"Regenerating architecture (attempt {attempt}/{max_attempts}) after failure: {last_error}"
+                )
+                self.model = None
+                continue
+
+            if should_stop:
+                self.stop_requested = True
+                self.model = None
+                self.optimizer = None
+                self.scheduler = None
+                self.epochs = 0
+                return
 
             try:
                 optimizer = self._build_optimizer(optimizer_assignment)
@@ -1056,6 +1205,8 @@ class GPTTrainer:
                 def __init__(self, trainer: "GPTTrainer") -> None:
                     self.optimizer = trainer.optimizer
                     self.scheduler: Optional[Any] = None
+                    self.training_epochs = trainer.epochs
+                    self.epochs = trainer.epochs
 
             context = _SchedulerContext(self)
             exec(command, {"torch": torch, "nn": nn, "cfg": self._model_context}, {"self": context})
@@ -1141,3 +1292,48 @@ class GPTTrainer:
             raise RuntimeError("Generated training epochs must be a positive integer.")
 
         return resolved
+
+    @staticmethod
+    def _resolve_stop_signal(command: Optional[str]) -> bool:
+        if not command:
+            return False
+
+        try:
+            class _StopContext:
+                def __init__(self) -> None:
+                    self.stop_training: Optional[Any] = None
+
+            context = _StopContext()
+            exec(command, {}, {"self": context})
+            value = getattr(context, "stop_training", None)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Generated stop command failed with error: {exc}"
+            ) from exc
+
+        if value is None:
+            raise RuntimeError(
+                "Generated stop command did not assign `self.stop_training`."
+            )
+
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "yes", "y"}:
+                return True
+            if lowered in {"false", "no", "n"}:
+                return False
+
+        raise RuntimeError("`self.stop_training` must resolve to a boolean value.")
+
+    def _save_best_model(self, path: Optional[str] = None) -> Optional[Path]:
+        if self.best_model_bundle is None:
+            return None
+
+        target = Path(path).expanduser() if path else Path("best_model.pt")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.best_model_bundle, target)
+        return target
