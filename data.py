@@ -5,13 +5,13 @@ import torch
 from torch import Tensor
 from torch.utils.data import TensorDataset
 
-from sklearn.datasets import load_breast_cancer
+from sklearn.datasets import fetch_covtype
 from sklearn.preprocessing import StandardScaler
 
 
 def make_toy_dataset() -> Tuple[Tensor, Tensor]:
-    """Load the Breast Cancer Wisconsin dataset and return normalized tensors."""
-    data = load_breast_cancer()
+    """Load the Covertype dataset and return normalized tensors."""
+    data = fetch_covtype()
     X = data.data
     y = data.target
 
@@ -19,7 +19,7 @@ def make_toy_dataset() -> Tuple[Tensor, Tensor]:
     normalized = scaler.fit_transform(X)
 
     xs = torch.tensor(normalized, dtype=torch.float32)
-    ys = torch.tensor(y, dtype=torch.long)
+    ys = torch.tensor(y - 1, dtype=torch.long)
     return xs, ys
 
 
