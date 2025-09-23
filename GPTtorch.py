@@ -19,20 +19,6 @@ try:
 except ImportError:
     openai = None  # type: ignore[assignment]
 
-# def list_available_layers() -> List[Dict[str, Any]]:
-#     """Return a list of all available torch.nn layers and their __init__ arguments."""
-#     layer_list: List[Dict[str, Any]] = []
-#     for name in dir(nn):
-#         obj = getattr(nn, name)
-#         if inspect.isclass(obj) and issubclass(obj, nn.Module) and obj is not nn.Module:
-#             try:
-#                 sig = inspect.signature(obj.__init__)
-#                 args = [p for p in sig.parameters if p != "self"]
-#                 layer_list.append({"layer": name, "args": args})
-#             except Exception:
-#                 layer_list.append({"layer": name, "args": "N/A (signature not available)"})
-#     return layer_list
-
 def _strip_code_fences(text: str) -> str:
     """Remove simple Markdown code fences from a model response."""
     result = text.strip()
@@ -436,7 +422,6 @@ def generate_layers(
                 "Please adjust the generated assignments to avoid this problem.\n"
             )
 
-    # layer_catalog = json.dumps(available_layers, indent=2)
     base_user_content = (
         f"{history_context}\n"
         f"{prior_assignments_context}"
@@ -683,9 +668,6 @@ def generate_layers(
             "generate_layers failed to produce a novel architecture after multiple attempts."
         )
     raise RuntimeError("generate_layers returned an empty layer assignment.")
-
-# # Cache available layers for use in generate_layers
-# available_layers = list_available_layers()
 
 # ----------------------
 # Model Definitions
