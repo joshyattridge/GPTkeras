@@ -786,7 +786,12 @@ class GPTTrainer:
         if batch_size <= 0:
             raise ValueError("`batch_size` must be a positive integer.")
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
 
         input_dim = xs.shape[1]
         unique_classes = torch.unique(ys)
