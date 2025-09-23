@@ -3,6 +3,7 @@ import os
 import json
 import inspect
 import re
+import hashlib
 from numbers import Integral
 from collections import deque
 from pathlib import Path
@@ -71,50 +72,81 @@ def _split_generated_assignments(
     Optional[str],
     Optional[str],
     Optional[str],
+    Optional[str],
+    Optional[str],
 ]:
-    """Extract layer, optimizer, epoch, scheduler, loss, stop, and early-stop assignments."""
-    optimizer_prefix = "self.optimizer ="
-    epochs_prefix = "self.training_epochs ="
-    scheduler_prefix = "self.scheduler ="
-    loss_prefix = "self.loss ="
-    stop_prefix = "self.stop_training ="
-    patience_prefix = "self.early_stop_patience ="
-    min_delta_prefix = "self.early_stop_min_delta ="
-    lines = [line.strip() for line in assignments.splitlines() if line.strip()]
-    layer_lines: List[str] = []
-    optimizer_line: Optional[str] = None
-    epochs_line: Optional[str] = None
-    scheduler_line: Optional[str] = None
-    loss_line: Optional[str] = None
-    stop_line: Optional[str] = None
-    patience_line: Optional[str] = None
-    min_delta_line: Optional[str] = None
-    for line in lines:
-        if line.startswith(optimizer_prefix):
-            optimizer_line = line
-        elif line.startswith(epochs_prefix):
-            epochs_line = line
-        elif line.startswith(scheduler_prefix):
-            scheduler_line = line
-        elif line.startswith(loss_prefix):
-            loss_line = line
-        elif line.startswith(stop_prefix):
-            stop_line = line
-        elif line.startswith(patience_prefix):
-            patience_line = line
-        elif line.startswith(min_delta_prefix):
-            min_delta_line = line
+    """Return each required `self.*` assignment block extracted from the response."""
+
+    blocks: Dict[str, List[str]] = {
+        "layers": [],
+        "optimizer": [],
+        "training_epochs": [],
+        "scheduler": [],
+        "loss": [],
+        "stop_training": [],
+        "early_stop_patience": [],
+        "early_stop_min_delta": [],
+        "run_signature": [],
+        "run_signature_hash": [],
+    }
+
+    current_key: Optional[str] = None
+    for raw_line in assignments.splitlines():
+        stripped = raw_line.strip()
+
+        if not stripped:
+            if current_key:
+                blocks[current_key].append(raw_line)
+            continue
+
+        if stripped.startswith("#") and current_key:
+            blocks[current_key].append(raw_line)
+            continue
+
+        match = re.match(r"self\.(\w+)\s*=", stripped)
+        if match:
+            key = match.group(1)
+            current_key = key if key in blocks else None
+            if current_key is not None:
+                blocks[current_key] = [raw_line]
+            continue
+
+        if current_key is not None:
+            blocks[current_key].append(raw_line)
+        elif blocks["layers"]:
+            blocks["layers"].append(raw_line)
         else:
-            layer_lines.append(line)
+            # Treat orphaned lines as part of the layers assignment by default
+            blocks["layers"].append(raw_line)
+
+    def _collect(key: str) -> Optional[str]:
+        lines = blocks.get(key, [])
+        if not lines:
+            return None
+        return "\n".join(lines)
+
+    layers_code = _collect("layers") or ""
+    optimizer_code = _collect("optimizer")
+    epochs_code = _collect("training_epochs")
+    scheduler_code = _collect("scheduler")
+    loss_code = _collect("loss")
+    stop_code = _collect("stop_training")
+    patience_code = _collect("early_stop_patience")
+    min_delta_code = _collect("early_stop_min_delta")
+    signature_code = _collect("run_signature")
+    signature_hash_code = _collect("run_signature_hash")
+
     return (
-        "\n".join(layer_lines),
-        optimizer_line,
-        epochs_line,
-        scheduler_line,
-        loss_line,
-        stop_line,
-        patience_line,
-        min_delta_line,
+        layers_code,
+        optimizer_code,
+        epochs_code,
+        scheduler_code,
+        loss_code,
+        stop_code,
+        patience_code,
+        min_delta_code,
+        signature_code,
+        signature_hash_code,
     )
 
 
@@ -412,8 +444,11 @@ def generate_layers(
         f"Context: tabular inputs with {cfg.input_dim} normalised features; target optimised with "
         f"`torch.nn.CrossEntropyLoss` over {cfg.num_classes} logits. Classes may be imbalanced, so incorporate"
         " techniques that handle imbalance when helpful."
-        " Log (layers_repr, optimiser, lr, schedule, batch_size, weight_decay, seed) and hash that tuple"
-        " to avoid reusing near-duplicates."
+        " Log the tuple (layers_repr, optimiser, lr, schedule, batch_size, weight_decay, seed) by assigning"
+        " it directly to `self.run_signature = (...)` and immediately hashing it via"
+        " `self.run_signature_hash = hashlib.sha256(repr(self.run_signature).encode('utf-8')).hexdigest()`"
+        " to avoid reusing near-duplicates. Use only literal strings or numeric scalars in that tuple—"
+        " never place nn.Module instances, optimizers, or schedulers inside it."
         f" Generate a PyTorch `nn.Sequential` for inputs of {cfg.input_dim} features and exactly {cfg.num_classes} logits;"
         f" ensure the final layer is `nn.Linear(..., {cfg.num_classes})`."
         " Design the architecture and regularisation strategy as you see fit, but never repeat an identical layer + hyperparameter tuple."
@@ -431,6 +466,7 @@ def generate_layers(
         " Encode that verdict as a boolean assignment `self.stop_training = <True|False>` with an inline comment"
         " answering the question \"Have we reached optimal results such that further model/hyperparameter changes would not help?\""
         " Use `True` only when you are confident further exploration is unlikely to help; otherwise emit `False`."
+        " Do not assume any fallback defaults will be applied—omit nothing and ensure each assignment is fully executable."
         " Respond with each required Python assignment on separate lines in the order specified by the system instruction."
         " Do not include code fences or extra narration."
     )
@@ -441,8 +477,8 @@ def generate_layers(
             "content": (
                 "You write concise Python for PyTorch modules. Respond with assignments in this exact order: "
                 "`self.layers = ...`, `self.optimizer = ...`, `self.training_epochs = ...`, "
-                "`self.early_stop_patience = ...`, `self.early_stop_min_delta = ...`. Optional "
-                "`self.scheduler = ...` and `self.loss = ...` assignments may follow afterward, and finish with "
+                "`self.early_stop_patience = ...`, `self.early_stop_min_delta = ...`, `self.scheduler = ...`, "
+                "`self.loss = ...`, `self.run_signature = ...`, `self.run_signature_hash = ...`, and finish with "
                 "a boolean verdict `self.stop_training = ...`."
             ),
         },
@@ -478,6 +514,8 @@ def generate_layers(
             stop_part,
             patience_part,
             min_delta_part,
+            signature_part,
+            signature_hash_part,
         ) = _split_generated_assignments(cleaned)
         normalized = _normalize_assignment(layers_part)
 
@@ -560,6 +598,57 @@ def generate_layers(
             )
             continue
 
+        if not scheduler_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Include a scheduler assignment in the form `self.scheduler = ...` with an inline"
+                        " summary; use `self.scheduler = None` if no scheduler is desired."
+                    ),
+                }
+            )
+            continue
+
+        if not loss_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Add a loss assignment like `self.loss = ...` describing the chosen criterion."
+                    ),
+                }
+            )
+            continue
+
+        if not signature_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Define `self.run_signature = (...)` capturing (layers_repr, optimiser, lr, schedule,"
+                        " batch_size, weight_decay, seed) with a verifying inline comment."
+                    ),
+                }
+            )
+            continue
+
+        if not signature_hash_part:
+            messages.append({"role": "assistant", "content": cleaned})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Compute `self.run_signature_hash = ...` (for example via hashlib.sha256) so the"
+                        " tuple above has a reproducible identifier."
+                    ),
+                }
+            )
+            continue
+
         if not stop_part:
             messages.append({"role": "assistant", "content": cleaned})
             messages.append(
@@ -573,12 +662,18 @@ def generate_layers(
             )
             continue
 
-        ordered_parts = [layers_part, optimizer_part, epochs_part, patience_part, min_delta_part]
-        if scheduler_part:
-            ordered_parts.append(scheduler_part)
-        if loss_part:
-            ordered_parts.append(loss_part)
-        ordered_parts.append(stop_part)
+        ordered_parts = [
+            layers_part,
+            optimizer_part,
+            epochs_part,
+            patience_part,
+            min_delta_part,
+            scheduler_part,
+            loss_part,
+            signature_part,
+            signature_hash_part,
+            stop_part,
+        ]
 
         return "\n".join([part for part in ordered_parts if part])
 
@@ -625,6 +720,8 @@ class SimpleClassifier(nn.Module):
             stop_code,
             patience_code,
             min_delta_code,
+            signature_code,
+            signature_hash_code,
         ) = _split_generated_assignments(generated_layers)
 
         # Keep a copy so training summaries can reference the generated architecture
@@ -636,13 +733,20 @@ class SimpleClassifier(nn.Module):
         self.generated_stop_code = stop_code or ""
         self.generated_patience_code = patience_code or ""
         self.generated_min_delta_code = min_delta_code or ""
+        self.generated_signature_code = signature_code or ""
+        self.generated_signature_hash_code = signature_hash_code or ""
+
+        if not self.generated_signature_code:
+            raise RuntimeError("Generated response omitted the required `self.run_signature = ...` assignment.")
+        if not self.generated_signature_hash_code:
+            raise RuntimeError("Generated response omitted the required `self.run_signature_hash = ...` assignment.")
 
         if layer_code and "self.layers" in layer_code:
             try:
                 layer_code = _repair_inline_comments(layer_code)
                 exec(
                     layer_code,
-                    {"nn": nn, "torch": torch, "cfg": cfg},
+                    {"nn": nn, "torch": torch, "cfg": cfg, "hashlib": hashlib},
                     {"self": self},
                 )
             except Exception as exc:
@@ -996,6 +1100,10 @@ class GPTTrainer:
                 "stopped_early": stalled >= patience,
                 "scheduler": self.scheduler.__class__.__name__ if self.scheduler else None,
                 "seed": self._model_context.seed,
+                "run_signature": getattr(self.model, "run_signature", None),
+                "run_signature_hash": getattr(self.model, "run_signature_hash", None),
+                "signature_code": getattr(self.model, "generated_signature_code", ""),
+                "signature_hash_code": getattr(self.model, "generated_signature_hash_code", ""),
             }
             run_record["stop_code"] = getattr(self.model, "generated_stop_code", "")
             self.training_history = history_copy
@@ -1018,6 +1126,10 @@ class GPTTrainer:
                         "stop_code": getattr(self.model, "generated_stop_code", ""),
                         "patience_code": getattr(self.model, "generated_patience_code", ""),
                         "min_delta_code": getattr(self.model, "generated_min_delta_code", ""),
+                        "signature_code": getattr(self.model, "generated_signature_code", ""),
+                        "signature_hash_code": getattr(self.model, "generated_signature_hash_code", ""),
+                        "run_signature": getattr(self.model, "run_signature", None),
+                        "run_signature_hash": getattr(self.model, "run_signature_hash", None),
                         "patience": patience,
                         "min_delta": min_delta,
                         "final_metrics": final_metrics,
@@ -1090,6 +1202,8 @@ class GPTTrainer:
                 stop_assignment,
                 patience_assignment,
                 min_delta_assignment,
+                signature_assignment,
+                signature_hash_assignment,
             ) = _split_generated_assignments(
                 getattr(model, "generated_layers_code", "")
             )
@@ -1219,6 +1333,21 @@ class GPTTrainer:
                 self.optimizer = None
                 continue
 
+            try:
+                self._apply_run_signature(signature_assignment, signature_hash_assignment)
+            except RuntimeError as exc:
+                command = (signature_assignment or "<run signature missing>").strip()
+                error_text = str(exc)
+                last_error = f"Run signature command `{command}` failed: {error_text}"
+                feedback = last_error
+                print(
+                    f"Regenerating architecture (attempt {attempt}/{max_attempts}) after failure: {error_text}"
+                )
+                self.model = None
+                self.optimizer = None
+                self.scheduler = None
+                continue
+
             return
 
         raise RuntimeError(
@@ -1270,14 +1399,7 @@ class GPTTrainer:
             raise RuntimeError("Optimizer must be initialized before creating a scheduler.")
 
         if not command:
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer,
-                mode="min",
-                factor=0.5,
-                patience=5,
-            )
-            self._model_context.scheduler = "ReduceLROnPlateau"
-            return scheduler
+            raise RuntimeError("Generated response omitted a scheduler assignment.")
 
         try:
             class _SchedulerContext:
@@ -1303,10 +1425,7 @@ class GPTTrainer:
 
     def _maybe_apply_custom_loss(self, command: Optional[str]) -> None:
         if not command:
-            self.criterion = self.criterion.to(self.device)
-            existing = getattr(self.criterion, "__class__", type(self.criterion))
-            self._model_context.loss = existing.__name__
-            return
+            raise RuntimeError("Generated response omitted a loss assignment.")
 
         try:
             class _LossContext:
@@ -1343,6 +1462,105 @@ class GPTTrainer:
 
         self.criterion = loss_module.to(self.device)
         self._model_context.loss = loss_module.__class__.__name__
+
+    def _apply_run_signature(
+        self,
+        signature_command: Optional[str],
+        signature_hash_command: Optional[str],
+    ) -> None:
+        if self.model is None:
+            raise RuntimeError("Model must be initialized before applying the run signature.")
+        if not signature_command:
+            raise RuntimeError("Generated response omitted the required `self.run_signature = ...` assignment.")
+        if not signature_hash_command:
+            raise RuntimeError("Generated response omitted the required `self.run_signature_hash = ...` assignment.")
+
+        model = self.model
+        optimizer = self.optimizer
+
+        setattr(model, "optimizer", optimizer)
+        setattr(model, "scheduler", self.scheduler)
+        setattr(model, "batch_size", int(self._model_context.batch_size))
+        setattr(model, "seed", int(self._model_context.seed))
+
+        weight_decay: Optional[float] = None
+        learning_rate: Optional[float] = None
+        if optimizer is not None and optimizer.param_groups:
+            params = optimizer.param_groups[0]
+            lr_value = params.get("lr")
+            wd_value = params.get("weight_decay")
+            if lr_value is not None:
+                try:
+                    learning_rate = float(lr_value)
+                except (TypeError, ValueError):
+                    learning_rate = None
+            if wd_value is not None:
+                try:
+                    weight_decay = float(wd_value)
+                except (TypeError, ValueError):
+                    weight_decay = None
+        setattr(model, "learning_rate", learning_rate)
+        setattr(model, "weight_decay", weight_decay)
+
+        signature_code = _repair_inline_comments(signature_command)
+        signature_hash_code = _repair_inline_comments(signature_hash_command)
+
+        try:
+            exec(
+                signature_code,
+                {"nn": nn, "torch": torch, "cfg": self._model_context, "hashlib": hashlib},
+                {"self": model},
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Unable to apply generated run signature: {exc}")
+
+        if not hasattr(model, "run_signature"):
+            raise RuntimeError("Generated run signature command did not assign `self.run_signature`." )
+
+        signature_value = getattr(model, "run_signature")
+        if not isinstance(signature_value, tuple) or len(signature_value) != 7:
+            raise RuntimeError(
+                "`self.run_signature` must be a tuple with seven elements: (layers_repr, optimiser, lr, schedule, batch_size, weight_decay, seed)."
+            )
+
+        layer_repr, optimiser_name, lr_value, schedule_name, batch_size_value, weight_decay_value, seed_value = signature_value
+
+        if not isinstance(layer_repr, str) or not layer_repr.strip():
+            raise RuntimeError("First element of `self.run_signature` must be a non-empty string describing the layers.")
+        if not isinstance(optimiser_name, str) or not optimiser_name.strip():
+            raise RuntimeError("Second element of `self.run_signature` must be a non-empty string naming the optimizer.")
+        if not isinstance(lr_value, (int, float)):
+            raise RuntimeError("Third element of `self.run_signature` must be a numeric learning rate.")
+        if not isinstance(schedule_name, str) or not schedule_name.strip():
+            raise RuntimeError("Fourth element of `self.run_signature` must be a non-empty string naming the scheduler.")
+        if not isinstance(batch_size_value, (int, float)):
+            raise RuntimeError("Fifth element of `self.run_signature` must be a numeric batch size.")
+        if not isinstance(weight_decay_value, (int, float)):
+            raise RuntimeError("Sixth element of `self.run_signature` must be a numeric weight decay.")
+        if not isinstance(seed_value, (int, float)):
+            raise RuntimeError("Seventh element of `self.run_signature` must be a numeric seed.")
+
+        try:
+            exec(
+                signature_hash_code,
+                {"nn": nn, "torch": torch, "cfg": self._model_context, "hashlib": hashlib},
+                {"self": model},
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Unable to apply generated run signature hash: {exc}")
+
+        if not hasattr(model, "run_signature_hash"):
+            raise RuntimeError("Generated run signature hash command did not assign `self.run_signature_hash`." )
+
+        signature_hash = getattr(model, "run_signature_hash")
+        if not isinstance(signature_hash, str) or not signature_hash.strip():
+            raise RuntimeError("`self.run_signature_hash` must be a non-empty string.")
+
+        expected_hash = hashlib.sha256(repr(signature_value).encode("utf-8")).hexdigest()
+        if signature_hash != expected_hash:
+            raise RuntimeError(
+                "`self.run_signature_hash` must equal `hashlib.sha256(repr(self.run_signature).encode('utf-8')).hexdigest()`."
+            )
 
     def _resolve_training_epochs(self, command: Optional[str]) -> int:
         if not command:
