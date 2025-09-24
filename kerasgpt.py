@@ -22,19 +22,9 @@ class GPTmodel:
         self.model = self.build_model()
 
     def build_model(self) -> keras.Model:
-        regularizer = keras.regularizers.l2(1e-4) if 1e-4 > 0 else None
         inputs = keras.Input(shape=(self.image_size, self.image_size, 1))
-        x = keras.layers.Conv2D(16, kernel_size=5, padding="same", activation="relu", kernel_regularizer=regularizer)(inputs)
-        x = keras.layers.BatchNormalization()(x)
-        x = keras.layers.MaxPooling2D()(x)
-        x = keras.layers.Conv2D(32, kernel_size=3, padding="same", activation="relu", kernel_regularizer=regularizer)(x)
-        x = keras.layers.BatchNormalization()(x)
-        x = keras.layers.MaxPooling2D()(x)
-        x = keras.layers.Conv2D(64, kernel_size=3, padding="same", activation="relu", kernel_regularizer=regularizer)(x)
-        x = keras.layers.Flatten()(x)
-        x = keras.layers.Dense(128, activation="relu", kernel_regularizer=regularizer)(x)
-        x = keras.layers.Dropout(0.2)(x)
-        outputs = keras.layers.Dense(self.num_classes, activation="softmax", kernel_regularizer=regularizer)(x)
+        x = keras.layers.Flatten()(inputs)
+        outputs = keras.layers.Dense(self.num_classes, activation="softmax")(x)
 
         model = keras.Model(inputs, outputs)
         optimizer = keras.optimizers.Adam(learning_rate=1e-3)
