@@ -55,7 +55,6 @@ class GPTmodel:
         self.input_shape = tuple(train_x.shape[1:]) if train_x.ndim > 1 else (1,)
         self.num_classes = int(train_y.max()) + 1 if np.issubdtype(train_y.dtype, np.integer) else 1
         self.gpt_client = OpenAIChatClient()
-        self.model = self.build_model()
 
     def build_model(self) -> keras.Model:
         if self.gpt_client is None:
@@ -113,6 +112,7 @@ Requirements:
         return prompt.strip()
 
     def fit(self):
+        self.model = self.build_model()
         self.model.fit(self.train_x, self.train_y, epochs=12, batch_size=128, validation_split=0.2)
 
 
