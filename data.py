@@ -1,34 +1,39 @@
-"""Dataset utilities powered by scikit-learn."""
-from typing import Tuple
+"""Utility helpers for loading image data from scikit-learn."""
 
-import torch
-from torch import Tensor
-from torch.utils.data import TensorDataset
+from __future__ import annotations
 
-from sklearn.datasets import fetch_covtype
-from sklearn.preprocessing import StandardScaler
+from typing import TYPE_CHECKING, Tuple
 
+import numpy as np
+from sklearn.datasets import load_digits
 
-def make_toy_dataset() -> Tuple[Tensor, Tensor]:
-    """Load the Covertype dataset and return normalized tensors."""
-    data = fetch_covtype()
-    X = data.data
-    y = data.target
-
-    scaler = StandardScaler()
-    normalized = scaler.fit_transform(X)
-
-    xs = torch.tensor(normalized, dtype=torch.float32)
-    ys = torch.tensor(y - 1, dtype=torch.long)
-    return xs, ys
+if TYPE_CHECKING:  # pragma: no cover - only for static type checking
+    from synthetic_image_classification import TrainingConfig
 
 
-def split_dataset(xs: Tensor, ys: Tensor, train_ratio: float) -> Tuple[TensorDataset, TensorDataset]:
-    num_train = int(len(xs) * train_ratio)
-    indices = torch.randperm(len(xs))
-    train_idx = indices[:num_train]
-    val_idx = indices[num_train:]
-    return (
-        TensorDataset(xs[train_idx], ys[train_idx]),
-        TensorDataset(xs[val_idx], ys[val_idx]),
-    )
+def load_digits_dataset() -> Tuple[np.ndarray, np.ndarray]:
+    """Load the scikit-learn digits dataset and adapt it to the training config."""
+    dataset = load_digits()
+    images = dataset.images.astype(np.float32) / 16.0
+    labels = dataset.target.astype(np.int32)
+
+    images = images[..., np.newaxis]
+    total_samples = images.shape[0]
+    requested_samples = 1000
+    rng = np.random.default_rng(42)
+
+    if requested_samples <= 0 or requested_samples > total_samples:
+        sampled_images = images
+        sampled_labels = labels
+        effective_samples = total_samples
+    else:
+        indices = rng.choice(total_samples, size=requested_samples, replace=False)
+        sampled_images = images[indices]
+        sampled_labels = labels[indices]
+        effective_samples = requested_samples
+
+    shuffle_indices = rng.permutation(effective_samples)
+    sampled_images = sampled_images[shuffle_indices]
+    sampled_labels = sampled_labels[shuffle_indices]
+
+    return sampled_images, sampled_labels
