@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
-from sklearn.datasets import load_digits
+from sklearn.datasets import load_digits, make_classification, make_regression
 
 if TYPE_CHECKING:  # pragma: no cover - only for static type checking
     from synthetic_image_classification import TrainingConfig
@@ -37,3 +37,32 @@ def load_digits_dataset() -> Tuple[np.ndarray, np.ndarray]:
     sampled_labels = sampled_labels[shuffle_indices]
 
     return sampled_images, sampled_labels
+
+
+def load_tabular_classification_dataset(n_samples: int = 1000, n_features: int = 20, n_classes: int = 3, random_state: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate a synthetic tabular classification dataset."""
+    X, y = make_classification(
+        n_samples=n_samples,
+        n_features=n_features,
+        n_informative=int(n_features * 0.6),
+        n_redundant=int(n_features * 0.2),
+        n_classes=n_classes,
+        random_state=random_state
+    )
+    X = X.astype(np.float32)
+    y = y.astype(np.int32)
+    return X, y
+
+
+def load_regression_dataset(n_samples: int = 1000, n_features: int = 20, random_state: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate a synthetic tabular regression dataset."""
+    X, y = make_regression(
+        n_samples=n_samples,
+        n_features=n_features,
+        n_informative=int(n_features * 0.6),
+        noise=0.2,
+        random_state=random_state
+    )
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+    return X, y
