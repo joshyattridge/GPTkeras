@@ -105,6 +105,7 @@ class GPTmodel:
 
         prompt = f"""
 You are an expert TensorFlow engineer. Generate Python source code for a function called create_model(input_shape, num_classes) that builds and compiles a tf.keras.Model for a {task_type} problem.
+If you know of any previous models that you created and the results they produced then use this information to influence your design.
 
 Project constraints:
 - Training input shape: {input_shape}
@@ -124,14 +125,34 @@ Requirements:
 """
         return prompt.strip()
 
-    def fit(self):
-        self.model = self.build_model()
-        if "epochs" not in self.training_config or "batch_size" not in self.training_config:
-            raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
+    def _can_results_be_improved_prompt(self, history: dict) -> str:
+        prompt = f"""
+        This is the results of training the model you generated:
+        {history}
+        Do you think these results can be improved further with a different architecture or training configuration? Answer with a short yes or no and nothing else.
+        """
+        return prompt.strip()
 
-        epochs = int(self.training_config["epochs"])
-        batch_size = int(self.training_config["batch_size"])
-        self.model.fit(self.train_x, self.train_y, epochs=epochs, batch_size=batch_size, validation_split=0.2)
+    def fit(self, max_iterations: int = 1) -> None:
+
+        for iteration in range(max_iterations):
+            self.model = self.build_model()
+            if "epochs" not in self.training_config or "batch_size" not in self.training_config:
+                raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
+
+            epochs = int(self.training_config["epochs"])
+            batch_size = int(self.training_config["batch_size"])
+            results = self.model.fit(self.train_x, self.train_y, epochs=epochs, batch_size=batch_size, validation_split=0.2)
+
+            can_results_be_improved = self.gpt_client.chat(self._can_results_be_improved_prompt(results.history)).strip().lower()
+            print(can_results_be_improved)
+
+            if "yes" not in can_results_be_improved.lower() and "no" not in can_results_be_improved.lower():
+                raise ValueError("GPT response to improvement prompt must be 'yes' or 'no'")
+
+            if "no" in can_results_be_improved.lower():
+                print("GPT determined that the model cannot be improved further.")
+                break
 
 
 
@@ -148,16 +169,16 @@ if __name__ == "__main__":
     images, labels = load_digits_dataset()
     print(images.shape, labels.shape)
     model = GPTmodel(images, labels)
-    model.fit()
+    model.fit(max_iterations=3)
 
-    # Example usage with the tabular classification dataset
-    X_class, y_class = load_tabular_classification_dataset()
-    print(X_class.shape, y_class.shape)
-    model_class = GPTmodel(X_class, y_class)
-    model_class.fit()
+    # # Example usage with the tabular classification dataset
+    # X_class, y_class = load_tabular_classification_dataset()
+    # print(X_class.shape, y_class.shape)
+    # model_class = GPTmodel(X_class, y_class)
+    # model_class.fit()
 
-    # Example usage with the regression dataset
-    X_reg, y_reg = load_regression_dataset()
-    print(X_reg.shape, y_reg.shape)
-    model_reg = GPTmodel(X_reg, y_reg)
-    model_reg.fit()
+    # # Example usage with the regression dataset
+    # X_reg, y_reg = load_regression_dataset()
+    # print(X_reg.shape, y_reg.shape)
+    # model_reg = GPTmodel(X_reg, y_reg)
+    # model_reg.fit()
