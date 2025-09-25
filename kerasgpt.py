@@ -135,7 +135,7 @@ class GPTmodel:
         if not callable(create_model):
             raise ValueError("GPT response did not define a callable create_model function")
 
-        model = create_model(input_shape=self.input_shape, num_classes=self.num_classes)
+        model = create_model()
         if not isinstance(model, keras.Model):
             raise TypeError("create_model must return a compiled keras.Model instance")
 
@@ -147,7 +147,7 @@ class GPTmodel:
         task_type = "classification" if self.num_classes > 1 else "regression"
 
         prompt = f"""
-You are an expert TensorFlow engineer. Generate Python source code for a function called create_model(input_shape, num_classes) that builds and compiles a tf.keras.Model for a {task_type} problem.
+You are an expert TensorFlow engineer. Generate Python source code for a function called create_model() that builds and compiles a tf.keras.Model for a {task_type} problem.
 If you know of any previous models that you created and the results they produced then use this information to influence your design.
 
 Project constraints:
@@ -159,12 +159,8 @@ Project constraints:
 
 Requirements:
 1. The function must be pure Python using tf.keras layers and return a compiled keras.Model instance.
-2. For classification tasks, include a final activation appropriate for the number of classes; for regression use a linear output and ignore the num_classes parameter.
-3. Compile using keras.optimizers.Adam with a sensible learning rate. Use sparse_categorical_crossentropy with accuracy when num_classes > 1, otherwise use mean_squared_error.
-4. Return valid Python that defines create_model(input_shape, num_classes) and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include explanations or markdown fences.
-5. Ensure BATCH_SIZE and EPOCHS are positive integers tailored to the task and data size.
-6. Use padding='same' (or otherwise ensure spatial dimensions stay valid) so pooling layers never encounter invalid dimensions for the provided input shape.
-7. Start the model with tf.keras.Input(shape=input_shape) and do not pass input_shape directly to other layers.
+2. Return valid Python that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include explanations or markdown fences.
+3. Ensure BATCH_SIZE and EPOCHS are positive integers tailored to the task and data size.
 """
         return prompt.strip()
 
@@ -222,7 +218,7 @@ if __name__ == "__main__":
     images, labels = load_digits_dataset()
     print(images.shape, labels.shape)
     model = GPTmodel(images, labels)
-    model.fit(max_iterations=3)
+    model.fit(max_iterations=100)
 
     # # Example usage with the tabular classification dataset
     # X_class, y_class = load_tabular_classification_dataset()
