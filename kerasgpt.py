@@ -250,6 +250,10 @@ Requirements:
         for callback in callbacks:
             if not isinstance(callback, keras.callbacks.Callback):
                 raise TypeError("create_callbacks must return keras.callbacks.Callback instances")
+
+            # Silence noisy checkpoint logging if the generated code enables it.
+            if isinstance(callback, keras.callbacks.ModelCheckpoint) and getattr(callback, "verbose", 0) != 0:
+                callback.verbose = 0
             validated_callbacks.append(callback)
 
         return validated_callbacks
