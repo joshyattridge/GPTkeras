@@ -11,6 +11,7 @@ from typing import Tuple
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
+from openai import OpenAI
 
 class OpenAIChatClient:
     def __init__(
@@ -21,12 +22,7 @@ class OpenAIChatClient:
         history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
         continue_from_history: bool = False,
     ):
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise ImportError("Install the openai package to use OpenAIChatClient") from exc
 
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OpenAI API key not provided")
 
