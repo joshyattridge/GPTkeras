@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -10,7 +13,13 @@ import tensorflow as tf
 from tensorflow import keras
 
 class OpenAIChatClient:
-    def __init__(self, api_key: str | None = None, model: str = "gpt-4o-mini", system_prompt: str | None = None):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "gpt-4o-mini",
+        system_prompt: str | None = None,
+        history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
+    ):
         try:
             from openai import OpenAI
         except ImportError as exc:
@@ -23,27 +32,59 @@ class OpenAIChatClient:
         self.client = OpenAI(api_key=api_key)
         self.model = model
         self.messages: list[dict[str, str]] = []
+        self.history_path = self._prepare_history_path(history_path)
         if system_prompt:
-            self.messages.append({"role": "system", "content": system_prompt})
+            self._append_message(role="system", content=system_prompt)
 
     def chat(self, content: str, role: str = "user", **kwargs) -> str:
         if not content:
             raise ValueError("Message content must be provided")
 
-        self.messages.append({"role": role, "content": content})
+        self._append_message(role=role, content=content)
         completion = self.client.chat.completions.create(model=self.model, messages=self.messages, **kwargs)
         message = completion.choices[0].message
         response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
-        self.messages.append({"role": "assistant", "content": response})
+        if not isinstance(response, str):
+            response = "" if response is None else str(response)
+        self._append_message(role="assistant", content=response)
         return response
 
     def reset(self, system_prompt: str | None = None) -> None:
         self.messages = []
+        self._record_history({"role": "event", "content": "conversation_reset"})
         if system_prompt:
-            self.messages.append({"role": "system", "content": system_prompt})
+            self._append_message(role="system", content=system_prompt)
 
     def history(self) -> list[dict[str, str]]:
         return list(self.messages)
+
+    def _prepare_history_path(self, history_path: str | os.PathLike[str] | None) -> Path | None:
+        if history_path is None:
+            return None
+
+        path = Path(history_path).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _append_message(self, role: str, content: str) -> None:
+        if not isinstance(content, str):
+            content = str(content)
+        message = {"role": role, "content": content}
+        self.messages.append(message)
+        self._record_history(message)
+
+    def _record_history(self, message: dict[str, str]) -> None:
+        if not self.history_path:
+            return
+
+        record = {
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            **message,
+        }
+        with self.history_path.open("a", encoding="utf-8") as history_file:
+            history_file.write(json.dumps(record) + "\n")
 
 
 
@@ -145,7 +186,6 @@ Requirements:
             results = self.model.fit(self.train_x, self.train_y, epochs=epochs, batch_size=batch_size, validation_split=0.2)
 
             can_results_be_improved = self.gpt_client.chat(self._can_results_be_improved_prompt(results.history)).strip().lower()
-            print(can_results_be_improved)
 
             if "yes" not in can_results_be_improved.lower() and "no" not in can_results_be_improved.lower():
                 raise ValueError("GPT response to improvement prompt must be 'yes' or 'no'")
