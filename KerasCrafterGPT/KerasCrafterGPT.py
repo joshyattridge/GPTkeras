@@ -205,10 +205,50 @@ class KerasCrafterGPT:
 
         return model
 
+    def _summarize_array(self, array: np.ndarray, max_preview_values: int = 128) -> dict[str, object]:
+        summary: dict[str, object] = {
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
+            "size": int(array.size),
+        }
+
+        if array.size == 0:
+            summary["sample_count"] = 0
+            summary["sample_description"] = "Array is empty"
+            summary["sample_values"] = []
+            return summary
+
+        is_numeric = np.issubdtype(array.dtype, np.number)
+
+        if is_numeric:
+            summary["min"] = float(np.min(array))
+            summary["max"] = float(np.max(array))
+            summary["mean"] = float(np.mean(array))
+            summary["std"] = float(np.std(array))
+
+        flat = array.reshape(-1)
+        if flat.size <= max_preview_values:
+            preview = flat
+            summary["sample_description"] = f"All {flat.size} values"
+        else:
+            indices = np.linspace(0, flat.size - 1, num=max_preview_values, dtype=int)
+            preview = flat[indices]
+            summary["sample_description"] = f"Uniform preview of {max_preview_values} values from {flat.size}"
+
+        if is_numeric:
+            preview = np.round(preview.astype(np.float64), decimals=6)
+
+        summary["sample_values"] = preview.tolist()
+        summary["sample_count"] = len(summary["sample_values"])
+
+        return summary
+
     def _build_prompt(self, sample_inputs: np.ndarray, sample_outputs: np.ndarray) -> str:
         input_shape = self.input_shape
         output_shape = tuple(sample_outputs.shape[1:]) if sample_outputs.ndim > 1 else ()
         task_type = "classification" if self.num_classes > 1 else "regression"
+        inputs_summary = json.dumps(self._summarize_array(sample_inputs), indent=2)
+        outputs_summary = json.dumps(self._summarize_array(sample_outputs), indent=2)
 
         prompt = f"""
 You are an expert TensorFlow engineer. Generate Python source code for a function called create_model() that builds and compiles a tf.keras.Model for a {task_type} problem.
@@ -218,8 +258,8 @@ Project constraints:
 - Training input shape: {input_shape}
 - Training output shape: {output_shape if output_shape else 'scalar'}
 - Number of target classes: {self.num_classes}
-- Sample input batch (first {len(sample_inputs)} rows): {sample_inputs.tolist()}
-- Sample target values: {sample_outputs.tolist()}
+- Sample input summary: {inputs_summary}
+- Sample target summary: {outputs_summary}
 - The constant BEST_MODEL_PATH is available for saving checkpoints.
 
 Requirements:
