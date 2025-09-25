@@ -122,7 +122,7 @@ class OpenAIChatClient:
 
 
 
-class kerasgpt:
+class KerasGPT:
     def __init__(
         self,
         train_x,

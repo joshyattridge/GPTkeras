@@ -1,2 +1,2 @@
 import os
-from kerasgpt.kerasgpt import kerasgpt
+from KerasGPT.KerasGPT import KerasGPT
