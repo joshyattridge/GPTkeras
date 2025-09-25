@@ -97,6 +97,8 @@ class GPTmodel:
         self.num_classes = int(train_y.max()) + 1 if np.issubdtype(train_y.dtype, np.integer) else 1
         self.gpt_client = OpenAIChatClient()
         self.training_config: dict[str, int] = {}
+        self.best_model_path = Path("best_model.keras")
+        self.best_val_loss = float("inf")
 
     def build_model(self) -> keras.Model:
         if self.gpt_client is None:
@@ -184,6 +186,17 @@ Requirements:
             epochs = int(self.training_config["epochs"])
             batch_size = int(self.training_config["batch_size"])
             results = self.model.fit(self.train_x, self.train_y, epochs=epochs, batch_size=batch_size, validation_split=0.2)
+
+            val_losses = results.history.get("val_loss")
+            candidate_loss = min(val_losses) if val_losses else None
+            if candidate_loss is None:
+                train_losses = results.history.get("loss") or []
+                candidate_loss = min(train_losses) if train_losses else None
+
+            if candidate_loss is not None and candidate_loss < self.best_val_loss:
+                self.best_val_loss = candidate_loss
+                self.model.save(self.best_model_path)
+                print(f"Saved new best model to {self.best_model_path}")
 
             can_results_be_improved = self.gpt_client.chat(self._can_results_be_improved_prompt(results.history)).strip().lower()
 
