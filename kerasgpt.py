@@ -11,6 +11,7 @@ from typing import Tuple
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
+from openai import OpenAI
 
 class OpenAIChatClient:
     def __init__(
@@ -20,12 +21,6 @@ class OpenAIChatClient:
         system_prompt: str | None = None,
         history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
     ):
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise ImportError("Install the openai package to use OpenAIChatClient") from exc
-
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OpenAI API key not provided")
 
@@ -90,12 +85,19 @@ class OpenAIChatClient:
 
 
 class GPTmodel:
-    def __init__(self, train_x, train_y):
+    def __init__(
+        self,
+        train_x,
+        train_y,
+        api_key: str | None = None,
+        model: str = "gpt-4o-mini",
+        history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
+    ):
         self.train_x = train_x
         self.train_y = train_y
         self.input_shape = tuple(train_x.shape[1:]) if train_x.ndim > 1 else (1,)
         self.num_classes = int(train_y.max()) + 1 if np.issubdtype(train_y.dtype, np.integer) else 1
-        self.gpt_client = OpenAIChatClient()
+        self.gpt_client = OpenAIChatClient(api_key=api_key, model=model, history_path=history_path)
         self.training_config: dict[str, int] = {}
         self.best_model_path = Path("best_model.keras")
         self.best_val_loss = float("inf")
@@ -213,11 +215,13 @@ Requirements:
 if __name__ == "__main__":
 
     from data import load_digits_dataset, load_regression_dataset, load_tabular_classification_dataset
+    api_key = os.getenv("OPENAI_API_KEY")
+
 
     # Example usage with the digits dataset
     images, labels = load_digits_dataset()
     print(images.shape, labels.shape)
-    model = GPTmodel(images, labels)
+    model = GPTmodel(images, labels, api_key=api_key)
     model.fit(max_iterations=100)
 
     # # Example usage with the tabular classification dataset
