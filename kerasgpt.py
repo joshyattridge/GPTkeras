@@ -135,7 +135,13 @@ class GPTmodel:
         self.train_x = train_x
         self.train_y = train_y
         self.input_shape = tuple(train_x.shape[1:]) if train_x.ndim > 1 else (1,)
-        self.num_classes = int(train_y.max()) + 1 if np.issubdtype(train_y.dtype, np.integer) else 1
+        if np.issubdtype(train_y.dtype, np.integer):
+            if train_y.ndim > 1 and train_y.shape[-1] > 1:
+                self.num_classes = int(train_y.shape[-1])
+            else:
+                self.num_classes = int(train_y.max()) + 1
+        else:
+            self.num_classes = 1
         self.gpt_client = OpenAIChatClient(
             api_key=api_key,
             model=model,
@@ -306,24 +312,42 @@ Requirements:
 
 if __name__ == "__main__":
 
-    from data import load_digits_dataset, load_regression_dataset, load_tabular_classification_dataset
+    from data import (
+        load_binary_classification_dataset,
+        load_digits_dataset,
+        load_imbalanced_classification_dataset,
+        load_multiclass_tabular_dataset,
+        load_multilabel_classification_dataset,
+        load_multioutput_regression_dataset,
+        load_sine_wave_forecasting_dataset,
+        load_synthetic_color_image_dataset,
+        load_synthetic_segmentation_dataset,
+        load_synthetic_text_classification_dataset,
+        load_regression_dataset,
+        load_tabular_classification_dataset,
+    )
+
     api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY must be set to run the GPTmodel demonstrations.")
 
+    dataset_configs = [
+        ("digits_image_classification", load_digits_dataset, {"requested_samples": 1000}, 1),
+        ("synthetic_tabular_classification", load_tabular_classification_dataset, {}, 1),
+        ("synthetic_regression", load_regression_dataset, {}, 1),
+        ("breast_cancer_binary_classification", load_binary_classification_dataset, {}, 1),
+        ("wine_multiclass_classification", load_multiclass_tabular_dataset, {}, 1),
+        ("linnerud_multioutput_regression", load_multioutput_regression_dataset, {}, 1),
+        ("synthetic_multilabel_classification", load_multilabel_classification_dataset, {}, 1),
+        ("synthetic_imbalanced_classification", load_imbalanced_classification_dataset, {}, 1),
+        ("synthetic_text_classification", load_synthetic_text_classification_dataset, {}, 1),
+        ("sine_wave_forecasting", load_sine_wave_forecasting_dataset, {}, 1),
+        ("synthetic_color_image_classification", load_synthetic_color_image_dataset, {}, 1),
+        ("synthetic_segmentation", load_synthetic_segmentation_dataset, {}, 1),
+    ]
 
-    # Example usage with the digits dataset
-    images, labels = load_digits_dataset()
-    print(images.shape, labels.shape)
-    model = GPTmodel(images, labels, api_key=api_key)
-    model.fit(max_iterations=3)
-
-    # # Example usage with the tabular classification dataset
-    # X_class, y_class = load_tabular_classification_dataset()
-    # print(X_class.shape, y_class.shape)
-    # model_class = GPTmodel(X_class, y_class)
-    # model_class.fit()
-
-    # # Example usage with the regression dataset
-    # X_reg, y_reg = load_regression_dataset()
-    # print(X_reg.shape, y_reg.shape)
-    # model_reg = GPTmodel(X_reg, y_reg)
-    # model_reg.fit()
+    for dataset_name, loader, loader_kwargs, max_iterations in dataset_configs:
+        features, targets = loader(**loader_kwargs)
+        print(f"{dataset_name}: {features.shape}, {targets.shape}")
+        model = GPTmodel(features, targets, api_key=api_key)
+        model.fit(max_iterations=max_iterations)
