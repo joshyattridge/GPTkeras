@@ -207,6 +207,7 @@ Requirements:
 1. The function must be pure Python using tf.keras layers and return a compiled keras.Model instance.
 2. Return valid Python that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include explanations or markdown fences.
 3. Ensure BATCH_SIZE and EPOCHS are positive integers tailored to the task and data size.
+4. Design the network so every convolution, pooling, or downsampling step keeps all spatial dimensions at least 1 for the provided input shape; adjust kernel sizes, strides, or padding (e.g., prefer padding="same" when needed) to avoid invalid tensor shapes.
 """
         return prompt.strip()
 
