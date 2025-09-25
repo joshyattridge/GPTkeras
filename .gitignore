@@ -6,3 +6,5 @@ __pycache__/
 .env
 .idea/
 .vscode/
+best_model.keras
+chat_history.jsonl

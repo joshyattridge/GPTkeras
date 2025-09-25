@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
+from typing import Callable, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -145,11 +145,13 @@ class GPTmodel:
         self.training_config: dict[str, int] = {}
         self.best_model_path = Path("best_model.keras")
         self.best_val_loss = float("inf")
+        self.callbacks_factory: Callable[[], list[keras.callbacks.Callback]] | None = None
 
     def build_model(self) -> keras.Model:
         if self.gpt_client is None:
             raise ValueError("OpenAIChatClient instance is required to build the model")
 
+        self.callbacks_factory = None
         sample_size = min(5, len(self.train_x))
         sample_inputs = self.train_x[: min(sample_size, len(self.train_x))]
         sample_outputs = self.train_y[: min(sample_size, len(self.train_y))]
@@ -159,7 +161,13 @@ class GPTmodel:
 
         print("Generated model code:\n", response)
 
-        exec_globals = {"keras": keras, "tf": tf, "np": np}
+        exec_globals = {
+            "keras": keras,
+            "tf": tf,
+            "np": np,
+            "Path": Path,
+            "BEST_MODEL_PATH": str(self.best_model_path),
+        }
         exec_locals: dict[str, object] = {}
         try:
             exec(response, exec_globals, exec_locals)
@@ -180,6 +188,12 @@ class GPTmodel:
         create_model = exec_locals.get("create_model")
         if not callable(create_model):
             raise ValueError("GPT response did not define a callable create_model function")
+
+        create_callbacks = exec_locals.get("create_callbacks")
+        if create_callbacks is not None and not callable(create_callbacks):
+            raise ValueError("create_callbacks must be callable when defined")
+        if callable(create_callbacks):
+            self.callbacks_factory = create_callbacks
 
         model = create_model()
         if not isinstance(model, keras.Model):
@@ -202,14 +216,39 @@ Project constraints:
 - Number of target classes: {self.num_classes}
 - Sample input batch (first {len(sample_inputs)} rows): {sample_inputs.tolist()}
 - Sample target values: {sample_outputs.tolist()}
+- The constant BEST_MODEL_PATH is available for saving checkpoints.
 
 Requirements:
 1. The function must be pure Python using tf.keras layers and return a compiled keras.Model instance.
 2. Return valid Python that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include explanations or markdown fences.
 3. Ensure BATCH_SIZE and EPOCHS are positive integers tailored to the task and data size.
 4. Design the network so every convolution, pooling, or downsampling step keeps all spatial dimensions at least 1 for the provided input shape; adjust kernel sizes, strides, or padding (e.g., prefer padding="same" when needed) to avoid invalid tensor shapes.
+5. Optionally define a create_callbacks() function with no parameters that returns a list (or tuple) of tf.keras.callbacks.Callback instances to use during training; return an empty list if no callbacks are needed.
+6. If using callbacks that write checkpoints, target BEST_MODEL_PATH and avoid writing to other locations.
 """
         return prompt.strip()
+
+    def _build_callbacks(self) -> list[keras.callbacks.Callback]:
+        if self.callbacks_factory is None:
+            return []
+
+        try:
+            callbacks = self.callbacks_factory()
+        except Exception as exc:
+            raise RuntimeError("create_callbacks() raised an exception") from exc
+
+        if callbacks is None:
+            return []
+        if not isinstance(callbacks, (list, tuple)):
+            raise TypeError("create_callbacks must return a list or tuple of keras.callbacks.Callback instances")
+
+        validated_callbacks: list[keras.callbacks.Callback] = []
+        for callback in callbacks:
+            if not isinstance(callback, keras.callbacks.Callback):
+                raise TypeError("create_callbacks must return keras.callbacks.Callback instances")
+            validated_callbacks.append(callback)
+
+        return validated_callbacks
 
     def _can_results_be_improved_prompt(self, history: dict) -> str:
         prompt = f"""
@@ -228,7 +267,15 @@ Requirements:
 
             epochs = int(self.training_config["epochs"])
             batch_size = int(self.training_config["batch_size"])
-            results = self.model.fit(self.train_x, self.train_y, epochs=epochs, batch_size=batch_size, validation_split=0.2)
+            callbacks = self._build_callbacks()
+            results = self.model.fit(
+                self.train_x,
+                self.train_y,
+                epochs=epochs,
+                batch_size=batch_size,
+                validation_split=0.2,
+                callbacks=callbacks,
+            )
 
             val_losses = results.history.get("val_loss")
             candidate_loss = min(val_losses) if val_losses else None
@@ -266,7 +313,7 @@ if __name__ == "__main__":
     # Example usage with the digits dataset
     images, labels = load_digits_dataset()
     print(images.shape, labels.shape)
-    model = GPTmodel(images, labels, api_key=api_key, continue_from_history=False)
+    model = GPTmodel(images, labels, api_key=api_key)
     model.fit(max_iterations=3)
 
     # # Example usage with the tabular classification dataset
