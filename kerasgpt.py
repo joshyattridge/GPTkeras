@@ -11,7 +11,6 @@ from typing import Tuple
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from openai import OpenAI
 
 class OpenAIChatClient:
     def __init__(
@@ -20,7 +19,14 @@ class OpenAIChatClient:
         model: str = "gpt-4o-mini",
         system_prompt: str | None = None,
         history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
+        continue_from_history: bool = False,
     ):
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError("Install the openai package to use OpenAIChatClient") from exc
+
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OpenAI API key not provided")
 
@@ -28,6 +34,7 @@ class OpenAIChatClient:
         self.model = model
         self.messages: list[dict[str, str]] = []
         self.history_path = self._prepare_history_path(history_path)
+        self._initialize_history(continue_from_history)
         if system_prompt:
             self._append_message(role="system", content=system_prompt)
 
@@ -81,6 +88,41 @@ class OpenAIChatClient:
         with self.history_path.open("a", encoding="utf-8") as history_file:
             history_file.write(json.dumps(record) + "\n")
 
+    def _initialize_history(self, continue_from_history: bool) -> None:
+        if not self.history_path:
+            return
+
+        if continue_from_history:
+            if not self.history_path.exists():
+                return
+
+            try:
+                with self.history_path.open("r", encoding="utf-8") as history_file:
+                    for line in history_file:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        role = record.get("role")
+                        content = record.get("content")
+                        if role not in {"system", "user", "assistant"} or content is None:
+                            continue
+                        if not isinstance(content, str):
+                            content = str(content)
+                        self.messages.append({"role": role, "content": content})
+            except OSError:
+                pass
+        else:
+            try:
+                self.history_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
 
 
 
@@ -92,12 +134,18 @@ class GPTmodel:
         api_key: str | None = None,
         model: str = "gpt-4o-mini",
         history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
+        continue_from_history: bool = False,
     ):
         self.train_x = train_x
         self.train_y = train_y
         self.input_shape = tuple(train_x.shape[1:]) if train_x.ndim > 1 else (1,)
         self.num_classes = int(train_y.max()) + 1 if np.issubdtype(train_y.dtype, np.integer) else 1
-        self.gpt_client = OpenAIChatClient(api_key=api_key, model=model, history_path=history_path)
+        self.gpt_client = OpenAIChatClient(
+            api_key=api_key,
+            model=model,
+            history_path=history_path,
+            continue_from_history=continue_from_history,
+        )
         self.training_config: dict[str, int] = {}
         self.best_model_path = Path("best_model.keras")
         self.best_val_loss = float("inf")
@@ -221,8 +269,8 @@ if __name__ == "__main__":
     # Example usage with the digits dataset
     images, labels = load_digits_dataset()
     print(images.shape, labels.shape)
-    model = GPTmodel(images, labels, api_key=api_key)
-    model.fit(max_iterations=100)
+    model = GPTmodel(images, labels, api_key=api_key, continue_from_history=False)
+    model.fit(max_iterations=3)
 
     # # Example usage with the tabular classification dataset
     # X_class, y_class = load_tabular_classification_dataset()
