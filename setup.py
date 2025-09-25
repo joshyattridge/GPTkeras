@@ -2,8 +2,8 @@ from setuptools import setup
 import codecs
 import os
 
-VERSION = "0.0.1"
-DESCRIPTION = "Toolkit for training Keras models with GPT-assisted workflows"
+VERSION = "0.0.2"
+DESCRIPTION = "Toolkit for building Keras models with the help of GPT"
 
 # read the contents of the README file
 with codecs.open("README.md", encoding="utf-8") as f:
