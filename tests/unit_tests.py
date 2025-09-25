@@ -2,7 +2,7 @@ import os
 import sys
 
 sys.path.append(os.path.abspath("../"))
-from KerasCrafterGPT import KerasCrafterGPT
+from GPTkeras import GPTkeras
 
 if __name__ == "__main__":
 
@@ -41,5 +41,5 @@ if __name__ == "__main__":
     for dataset_name, loader, loader_kwargs, max_iterations in dataset_configs:
         features, targets = loader(**loader_kwargs)
         print(f"{dataset_name}: {features.shape}, {targets.shape}")
-        model = KerasCrafterGPT(features, targets, api_key=api_key)
+        model = GPTkeras(features, targets, api_key=api_key)
         model.fit(max_iterations=max_iterations)

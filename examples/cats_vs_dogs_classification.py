@@ -1,4 +1,4 @@
-"""Example: train KerasCrafterGPT on the classic Cats vs Dogs dataset."""
+"""Example: train GPTkeras on the classic Cats vs Dogs dataset."""
 from __future__ import annotations
 
 import os
@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if REPO_ROOT.exists() and str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from KerasCrafterGPT import KerasCrafterGPT
+from GPTkeras import GPTkeras
 
 _DATASET_ORIGIN = "https://storage.googleapis.com/mledu-datasets/cats_and_dogs_filtered.zip"
 
@@ -53,7 +53,7 @@ def _load_numpy_data(
     limit_per_class: int = 200,
     batch_size: int = 32,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Create balanced numpy arrays from the dataset for KerasCrafterGPT."""
+    """Create balanced numpy arrays from the dataset for GPTkeras."""
     data_dir = _download_dataset()
     train_dir = data_dir / "train"
 
@@ -104,7 +104,7 @@ def main() -> None:
 
     train_x, train_y = _load_numpy_data()
 
-    model = KerasCrafterGPT(
+    model = GPTkeras(
         train_x,
         train_y,
         api_key=api_key,

@@ -11,13 +11,13 @@ with codecs.open("README.md", encoding="utf-8") as f:
 
 # Setting up
 setup(
-    name="KerasCrafterGPT",
+    name="GPTkeras",
     version=VERSION,
     author="Joshua Attridge",
     description=DESCRIPTION,
     long_description_content_type="text/markdown",
     long_description=LONG_DESCRIPTION,
-    packages=["KerasCrafterGPT"],
+    packages=["GPTkeras"],
     install_requires=["tensorflow", "numpy", "openai"],
     keywords=[
         "keras",
@@ -29,7 +29,7 @@ setup(
         "chatgpt",
         "ai",
     ],
-    url="https://github.com/joshyattridge/KerasCrafterGPT",
+    url="https://github.com/joshyattridge/GPTkeras",
     classifiers=[
         "Development Status :: 1 - Planning",
         "Intended Audience :: Developers",
