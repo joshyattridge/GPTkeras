@@ -209,32 +209,3 @@ def load_synthetic_color_image_dataset(
 
     shuffle_idx = rng.permutation(n_samples)
     return images[shuffle_idx], labels[shuffle_idx]
-
-
-def load_synthetic_segmentation_dataset(
-    n_samples: int = 200,
-    image_size: int = 32,
-    random_state: int = 42,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Generate binary segmentation masks with rectangular foreground regions."""
-    rng = np.random.default_rng(random_state)
-    images = np.zeros((n_samples, image_size, image_size, 1), dtype=np.float32)
-    masks = np.zeros((n_samples, image_size, image_size, 1), dtype=np.int32)
-
-    for idx in range(n_samples):
-        top = rng.integers(0, image_size // 2)
-        left = rng.integers(0, image_size // 2)
-        height = rng.integers(image_size // 4, image_size - top)
-        width = rng.integers(image_size // 4, image_size - left)
-        mask = np.zeros((image_size, image_size, 1), dtype=np.int32)
-        mask[top : top + height, left : left + width, 0] = 1
-
-        texture = rng.uniform(0.0, 0.3, size=(image_size, image_size, 1)).astype(np.float32)
-        texture += mask.astype(np.float32) * rng.uniform(0.6, 1.0)
-        texture += rng.normal(scale=0.05, size=texture.shape)
-
-        images[idx] = np.clip(texture, 0.0, 1.0)
-        masks[idx] = mask
-
-    shuffle_idx = rng.permutation(n_samples)
-    return images[shuffle_idx], masks[shuffle_idx]

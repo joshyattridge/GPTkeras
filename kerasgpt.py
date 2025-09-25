@@ -321,7 +321,6 @@ if __name__ == "__main__":
         load_multioutput_regression_dataset,
         load_sine_wave_forecasting_dataset,
         load_synthetic_color_image_dataset,
-        load_synthetic_segmentation_dataset,
         load_synthetic_text_classification_dataset,
         load_regression_dataset,
         load_tabular_classification_dataset,
@@ -343,7 +342,6 @@ if __name__ == "__main__":
         ("synthetic_text_classification", load_synthetic_text_classification_dataset, {}, 1),
         ("sine_wave_forecasting", load_sine_wave_forecasting_dataset, {}, 1),
         ("synthetic_color_image_classification", load_synthetic_color_image_dataset, {}, 1),
-        ("synthetic_segmentation", load_synthetic_segmentation_dataset, {}, 1),
     ]
 
     for dataset_name, loader, loader_kwargs, max_iterations in dataset_configs:
