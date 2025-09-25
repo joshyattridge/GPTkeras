@@ -165,8 +165,6 @@ class GPTmodel:
 
         response = self.gpt_client.chat(prompt)
 
-        print("Generated model code:\n", response)
-
         exec_globals = {
             "keras": keras,
             "tf": tf,
@@ -264,7 +262,26 @@ Requirements:
         """
         return prompt.strip()
 
-    def fit(self, max_iterations: int = 1) -> None:
+    class SingleLineLogger(keras.callbacks.Callback):
+        def __init__(self, model_iteration: int = 0):
+            super().__init__()
+            self.model_iteration = model_iteration
+
+        def on_train_begin(self, logs=None):
+            # Print model summary before training starts
+            if hasattr(self, 'model') and self.model is not None:
+                self.model.summary()
+
+        def on_epoch_end(self, epoch, logs=None):
+            logs = logs or {}
+            msg = f"Model {self.model_iteration}: " + ", ".join([f"{k}={v:.4f}" for k, v in logs.items()])
+            print(f"\r{msg}", end='')
+
+        def on_train_end(self, logs=None):
+            print()
+            print()
+
+    def fit(self, max_iterations: int = 1, verbose: int = 1) -> None:
 
         for iteration in range(max_iterations):
             self.model = self.build_model()
@@ -273,7 +290,9 @@ Requirements:
 
             epochs = int(self.training_config["epochs"])
             batch_size = int(self.training_config["batch_size"])
-            callbacks = self._build_callbacks()
+            callbacks = self._build_callbacks() 
+            if verbose > 0:
+                callbacks.append(self.SingleLineLogger(model_iteration=iteration))
             results = self.model.fit(
                 self.train_x,
                 self.train_y,
@@ -281,6 +300,7 @@ Requirements:
                 batch_size=batch_size,
                 validation_split=0.2,
                 callbacks=callbacks,
+                verbose=0,
             )
 
             val_losses = results.history.get("val_loss")
@@ -292,7 +312,6 @@ Requirements:
             if candidate_loss is not None and candidate_loss < self.best_val_loss:
                 self.best_val_loss = candidate_loss
                 self.model.save(self.best_model_path)
-                print(f"Saved new best model to {self.best_model_path}")
 
             can_results_be_improved = self.gpt_client.chat(self._can_results_be_improved_prompt(results.history)).strip().lower()
 
