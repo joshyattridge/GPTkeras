@@ -8,3 +8,5 @@ __pycache__/
 .vscode/
 best_model.keras
 chat_history.jsonl
+dist/
+*.egg-info/
