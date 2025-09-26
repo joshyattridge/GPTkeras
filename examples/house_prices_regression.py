@@ -125,6 +125,19 @@ def _write_submission(predictions: np.ndarray, test_ids: np.ndarray) -> Path:
     return submission_path
 
 
+def plot_results(name, values):
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(values, marker='o')
+    plt.title(f'{name} over Iterations')
+    plt.xlabel('Iteration')
+    plt.ylabel(name)
+    plt.grid(True)
+    plt.savefig(f'{name}_plot.png')
+    plt.close()
+
+
 def main() -> None:
     # run the command below to set your OpenAI API key
     # export OPENAI_API_KEY="your_api_key_here"
@@ -141,7 +154,12 @@ def main() -> None:
     )
 
     # Limit iterations to keep the demo lightweight.
-    model.fit(max_iterations=100)
+    results = model.fit(max_iterations=20)
+    print(results["history"])
+    plot_results('loss', results["history"]['loss'])
+    plot_results('val_loss', results["history"]['val_loss'])
+    plot_results('mae', results["history"]['mae'])
+    plot_results('val_mae', results["history"]['val_mae'])
 
     if not model.best_model_path.exists():
         raise RuntimeError(
