@@ -188,7 +188,7 @@ Project constraints:
 
 Requirements:
 1. The function must be pure Python using tf.keras layers and return a compiled keras.Model instance.
-2. Return valid Python that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include explanations or markdown fences.
+2. Respond with raw Python code that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include narrative text, comments outside of code, or any Markdown/backtick fences. The first non-empty line must start with either BATCH_SIZE or EPOCHS.
 3. Ensure BATCH_SIZE and EPOCHS are positive integers tailored to the task and data size.
 4. Design the network so every convolution, pooling, or downsampling step keeps all spatial dimensions at least 1 for the provided input shape; adjust kernel sizes, strides, or padding (e.g., prefer padding="same" when needed) to avoid invalid tensor shapes.
 5. Always define a create_callbacks() function with no parameters that returns a list (or tuple) of tf.keras.callbacks.Callback instances including EarlyStopping and a learning-rate scheduler (e.g., ReduceLROnPlateau or LearningRateScheduler); keep learning rates from decaying to zero by setting a positive floor (e.g., `min_lr > 0` or a cosine schedule with a floor). Callbacks that write checkpoints must target BEST_MODEL_PATH and avoid other locations.
