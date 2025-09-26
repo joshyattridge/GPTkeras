@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,8 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from openai import OpenAI
+
+DEFAULT_SEED = 42
 
 class OpenAIChatClient:
     def __init__(
@@ -131,10 +134,16 @@ class GPTkeras:
         model: str = "gpt-4o-mini",
         history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
         continue_from_history: bool = False,
+        seed: int | None = DEFAULT_SEED,
     ):
         self.train_x = train_x
         self.train_y = train_y
         self.input_shape = tuple(train_x.shape[1:]) if train_x.ndim > 1 else (1,)
+        if seed is not None and not isinstance(seed, (int, np.integer)):
+            raise TypeError("seed must be an integer or None")
+        self.seed = int(seed) if seed is not None else None
+        if self.seed is not None:
+            self._set_seed(self.seed)
         if np.issubdtype(train_y.dtype, np.integer):
             if train_y.ndim > 1 and train_y.shape[-1] > 1:
                 self.num_classes = int(train_y.shape[-1])
@@ -151,7 +160,19 @@ class GPTkeras:
         self.training_config: dict[str, int] = {}
         self.best_model_path = Path("best_model.keras")
         self.best_val_loss = float("inf")
+        self.best_model = None
         self.callbacks_factory: Callable[[], list[keras.callbacks.Callback]] | None = None
+
+    def _set_seed(self, seed: int) -> None:
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        try:
+            tf.keras.utils.set_random_seed(seed)
+        except AttributeError:
+            tf.random.set_seed(seed)
+        else:
+            tf.random.set_seed(seed)
 
     def build_model(self) -> keras.Model:
         if self.gpt_client is None:
@@ -203,7 +224,7 @@ class GPTkeras:
         if not isinstance(model, keras.Model):
             raise TypeError("create_model must return a compiled keras.Model instance")
 
-        return model
+        return model, response
 
     def _summarize_array(self, array: np.ndarray, max_preview_values: int = 128) -> dict[str, object]:
         summary: dict[str, object] = {
@@ -275,6 +296,9 @@ Requirements:
 8. Always include at least one form of regularisation such as Dropout, kernel/bias weight decay, or BatchNormalization layers.
 9. Add input normalisation or rescaling layers that suit the data type so the model sees well-scaled inputs.
 10. Ensure the final layer activation and compiled loss exactly match the task type (binary classification, multi-class classification, or regression).
+
+Current Best Model:
+{self.best_model if self.best_model is not None else 'No best model yet'}
 """
         return prompt.strip()
 
@@ -337,7 +361,7 @@ Requirements:
         overall_results = {"history": {}, "models": []}
 
         for iteration in range(max_iterations):
-            self.model = self.build_model()
+            self.model, response = self.build_model()
             if "epochs" not in self.training_config or "batch_size" not in self.training_config:
                 raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
 
@@ -372,6 +396,7 @@ Requirements:
             if candidate_loss is not None and candidate_loss < self.best_val_loss:
                 self.best_val_loss = candidate_loss
                 self.model.save(self.best_model_path)
+                self.best_model = response
 
             can_results_be_improved = self.gpt_client.chat(self._can_results_be_improved_prompt(results.history)).strip().lower()
 
