@@ -253,6 +253,8 @@ class GPTkeras:
         prompt = f"""
 You are an expert TensorFlow engineer. Generate Python source code for a function called create_model() that builds and compiles a tf.keras.Model for a {task_type} problem.
 If you know of any previous models that you created and the results they produced then use this information to influence your design.
+You can make small architectural or hyperparameter changes because you will have {self.max_iterations} opportunities to iterate; focus on steady improvements while guarding against overfitting or underfitting.
+But make sure that you are showing steady improvements before you reach {self.max_iterations} iterations.
 
 Project constraints:
 - Training input shape: {input_shape}
@@ -267,8 +269,12 @@ Requirements:
 2. Return valid Python that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include explanations or markdown fences.
 3. Ensure BATCH_SIZE and EPOCHS are positive integers tailored to the task and data size.
 4. Design the network so every convolution, pooling, or downsampling step keeps all spatial dimensions at least 1 for the provided input shape; adjust kernel sizes, strides, or padding (e.g., prefer padding="same" when needed) to avoid invalid tensor shapes.
-5. Optionally define a create_callbacks() function with no parameters that returns a list (or tuple) of tf.keras.callbacks.Callback instances to use during training; return an empty list if no callbacks are needed.
-6. If using callbacks that write checkpoints, target BEST_MODEL_PATH and avoid writing to other locations.
+5. Always define a create_callbacks() function with no parameters that returns a list (or tuple) of tf.keras.callbacks.Callback instances including EarlyStopping and a learning-rate scheduler (e.g., ReduceLROnPlateau or LearningRateScheduler); keep learning rates from decaying to zero by setting a positive floor (e.g., `min_lr > 0` or a cosine schedule with a floor). Callbacks that write checkpoints must target BEST_MODEL_PATH and avoid other locations.
+6. Keep the total number of trainable parameters reasonable for the dataset size; avoid unnecessarily large models.
+7. Do not use Flatten layers on high-dimensional feature maps—prefer pooling or global pooling to reduce dimensionality before any flattening step.
+8. Always include at least one form of regularisation such as Dropout, kernel/bias weight decay, or BatchNormalization layers.
+9. Add input normalisation or rescaling layers that suit the data type so the model sees well-scaled inputs.
+10. Ensure the final layer activation and compiled loss exactly match the task type (binary classification, multi-class classification, or regression).
 """
         return prompt.strip()
 
@@ -326,7 +332,7 @@ Requirements:
             print()
 
     def fit(self, max_iterations: int = 1, verbose: int = 1) -> None:
-
+        self.max_iterations = max_iterations
         for iteration in range(max_iterations):
             self.model = self.build_model()
             if "epochs" not in self.training_config or "batch_size" not in self.training_config:
