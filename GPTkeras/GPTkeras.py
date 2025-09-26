@@ -16,115 +16,6 @@ from openai import OpenAI
 
 DEFAULT_SEED = 42
 
-class OpenAIChatClient:
-    def __init__(
-        self,
-        api_key: str | None = None,
-        model: str = "gpt-4o-mini",
-        system_prompt: str | None = None,
-        history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
-        continue_from_history: bool = False,
-    ):
-
-        if not api_key:
-            raise ValueError("OpenAI API key not provided")
-
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
-        self.messages: list[dict[str, str]] = []
-        self.history_path = self._prepare_history_path(history_path)
-        self._initialize_history(continue_from_history)
-        if system_prompt:
-            self._append_message(role="system", content=system_prompt)
-
-    def chat(self, content: str, role: str = "user", **kwargs) -> str:
-        if not content:
-            raise ValueError("Message content must be provided")
-
-        self._append_message(role=role, content=content)
-        completion = self.client.chat.completions.create(model=self.model, messages=self.messages, **kwargs)
-        message = completion.choices[0].message
-        response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
-        if not isinstance(response, str):
-            response = "" if response is None else str(response)
-        self._append_message(role="assistant", content=response)
-        return response
-
-    def reset(self, system_prompt: str | None = None) -> None:
-        self.messages = []
-        self._record_history({"role": "event", "content": "conversation_reset"})
-        if system_prompt:
-            self._append_message(role="system", content=system_prompt)
-
-    def history(self) -> list[dict[str, str]]:
-        return list(self.messages)
-
-    def _prepare_history_path(self, history_path: str | os.PathLike[str] | None) -> Path | None:
-        if history_path is None:
-            return None
-
-        path = Path(history_path).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _append_message(self, role: str, content: str) -> None:
-        if not isinstance(content, str):
-            content = str(content)
-        message = {"role": role, "content": content}
-        self.messages.append(message)
-        self._record_history(message)
-
-    def _record_history(self, message: dict[str, str]) -> None:
-        if not self.history_path:
-            return
-
-        record = {
-            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            **message,
-        }
-        with self.history_path.open("a", encoding="utf-8") as history_file:
-            history_file.write(json.dumps(record) + "\n")
-
-    def _initialize_history(self, continue_from_history: bool) -> None:
-        if not self.history_path:
-            return
-
-        if continue_from_history:
-            if not self.history_path.exists():
-                return
-
-            try:
-                with self.history_path.open("r", encoding="utf-8") as history_file:
-                    for line in history_file:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        role = record.get("role")
-                        content = record.get("content")
-                        if role not in {"system", "user", "assistant"} or content is None:
-                            continue
-                        if not isinstance(content, str):
-                            content = str(content)
-                        self.messages.append({"role": role, "content": content})
-            except OSError:
-                pass
-        else:
-            try:
-                self.history_path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-
-
-
-
 class GPTkeras:
     def __init__(
         self,
@@ -151,16 +42,12 @@ class GPTkeras:
                 self.num_classes = int(train_y.max()) + 1
         else:
             self.num_classes = 1
-        self.gpt_client = OpenAIChatClient(
-            api_key=api_key,
-            model=model,
-            history_path=history_path,
-            continue_from_history=continue_from_history,
-        )
+        self.gpt_client = OpenAI(api_key=api_key)
+        self.gpt_model = model
         self.training_config: dict[str, int] = {}
         self.best_model_path = Path("best_model.keras")
-        self.best_val_loss = float("inf")
         self.best_model = None
+        self.best_model_results = None
         self.callbacks_factory: Callable[[], list[keras.callbacks.Callback]] | None = None
 
     def _set_seed(self, seed: int) -> None:
@@ -174,6 +61,18 @@ class GPTkeras:
         else:
             tf.random.set_seed(seed)
 
+    def chat(self, messages) -> str:
+        print(messages)
+        if self.gpt_client is None:
+            raise ValueError("OpenAIChatClient instance is required to chat")
+        completion = self.gpt_client.chat.completions.create(model=self.gpt_model, messages=messages)
+        message = completion.choices[0].message
+        response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+        if not isinstance(response, str):
+            response = "" if response is None else str(response)
+        print(response)
+        return response
+
     def build_model(self) -> keras.Model:
         if self.gpt_client is None:
             raise ValueError("OpenAIChatClient instance is required to build the model")
@@ -184,7 +83,9 @@ class GPTkeras:
         sample_outputs = self.train_y[: min(sample_size, len(self.train_y))]
         prompt = self._build_prompt(sample_inputs=sample_inputs, sample_outputs=sample_outputs)
 
-        response = self.gpt_client.chat(prompt)
+        response = self.chat([{"role": "user", "content": prompt}]).strip()
+        if not response:
+            raise RuntimeError("GPT did not return any model code")
 
         exec_globals = {
             "keras": keras,
@@ -299,6 +200,8 @@ Requirements:
 
 Current Best Model:
 {self.best_model if self.best_model is not None else 'No best model yet'}
+Current Best Model Results:
+{self.best_model_results if self.best_model_results is not None else 'N/A'}
 """
         return prompt.strip()
 
@@ -327,14 +230,6 @@ Current Best Model:
             validated_callbacks.append(callback)
 
         return validated_callbacks
-
-    def _can_results_be_improved_prompt(self, history: dict) -> str:
-        prompt = f"""
-        This is the results of training the model you generated:
-        {history}
-        Do you think these results can be improved further with a different architecture or training configuration? Answer with a short yes or no and nothing else.
-        """
-        return prompt.strip()
 
     class SingleLineLogger(keras.callbacks.Callback):
         def __init__(self, model_iteration: int = 0):
@@ -387,24 +282,12 @@ Current Best Model:
                     overall_results["history"][history_key] = []
                 overall_results["history"][history_key].append(history_values[-1])
 
-            val_losses = results.history.get("val_loss")
-            candidate_loss = min(val_losses) if val_losses else None
-            if candidate_loss is None:
-                train_losses = results.history.get("loss") or []
-                candidate_loss = min(train_losses) if train_losses else None
 
-            if candidate_loss is not None and candidate_loss < self.best_val_loss:
-                self.best_val_loss = candidate_loss
-                self.model.save(self.best_model_path)
+            if (min(self.best_model_results["val_loss"]) > min(results.history["val_loss"]) and min(self.best_model_results["loss"]) > min(results.history["loss"])) if self.best_model_results is not None else True:
                 self.best_model = response
-
-            can_results_be_improved = self.gpt_client.chat(self._can_results_be_improved_prompt(results.history)).strip().lower()
-
-            if "yes" not in can_results_be_improved.lower() and "no" not in can_results_be_improved.lower():
-                raise ValueError("GPT response to improvement prompt must be 'yes' or 'no'")
-
-            if "no" in can_results_be_improved.lower():
-                print("GPT determined that the model cannot be improved further.")
-                break
+                self.best_model_results = results.history
+                self.model.save(self.best_model_path)
+                if verbose > 0:
+                    print(f"New best model found and saved to {self.best_model_path}")
 
         return overall_results
