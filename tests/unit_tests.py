@@ -42,4 +42,5 @@ if __name__ == "__main__":
         features, targets = loader(**loader_kwargs)
         print(f"{dataset_name}: {features.shape}, {targets.shape}")
         model = GPTkeras(features, targets, api_key=api_key)
-        model.fit(max_iterations=max_iterations)
+        results = model.fit(max_iterations=max_iterations)
+        print(results["history"])

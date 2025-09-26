@@ -331,8 +331,11 @@ Requirements:
             print()
             print()
 
-    def fit(self, max_iterations: int = 1, verbose: int = 1) -> None:
+    def fit(self, max_iterations: int = 1, verbose: int = 1) -> dict:
         self.max_iterations = max_iterations
+
+        overall_results = {"history": {}, "models": []}
+
         for iteration in range(max_iterations):
             self.model = self.build_model()
             if "epochs" not in self.training_config or "batch_size" not in self.training_config:
@@ -353,6 +356,13 @@ Requirements:
                 verbose=0,
             )
 
+            overall_results["models"].append(self.model)
+
+            for history_key, history_values in results.history.items():
+                if history_key not in overall_results["history"]:
+                    overall_results["history"][history_key] = []
+                overall_results["history"][history_key].append(history_values[-1])
+
             val_losses = results.history.get("val_loss")
             candidate_loss = min(val_losses) if val_losses else None
             if candidate_loss is None:
@@ -371,3 +381,5 @@ Requirements:
             if "no" in can_results_be_improved.lower():
                 print("GPT determined that the model cannot be improved further.")
                 break
+
+        return overall_results
