@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import random
@@ -15,6 +16,13 @@ from tensorflow import keras
 from openai import OpenAI
 
 DEFAULT_SEED = 42
+
+
+@dataclass(frozen=True)
+class MetricSnapshot:
+    name: str
+    value: float
+    direction: str  # "min" or "max"
 
 class GPTkeras:
     def __init__(
@@ -49,6 +57,9 @@ class GPTkeras:
         self.best_model = None
         self.best_model_results = None
         self.callbacks_factory: Callable[[], list[keras.callbacks.Callback]] | None = None
+        self.model_iterations: list[dict[str, object]] = []
+        self.improved_changes: list[str] = []
+        self.worsened_changes: list[str] = []
 
     def _set_seed(self, seed: int) -> None:
         os.environ["PYTHONHASHSEED"] = str(seed)
@@ -222,7 +233,139 @@ Current Best Model:
 Current Best Model Results:
 {self.best_model_results if self.best_model_results is not None else 'N/A'}
 """
+
+        # if self.improved_changes:
+        #     prompt += "\n\nPast Changes That Helped:\n"
+        #     for change in self.improved_changes[-5:]:
+        #         prompt += f"- {change}\n"
+
+        if self.worsened_changes:
+            prompt += "\nPast Changes That Hurt:\n"
+            for change in self.worsened_changes[-5:]:
+                prompt += f"- {change}\n"
+
         return prompt.strip()
+
+    def _select_primary_metric(self, history: dict[str, list[float]]) -> MetricSnapshot | None:
+        if not history:
+            return None
+
+        metric_preferences = [
+            ("val_loss", "min"),
+            ("val_mae", "min"),
+            ("val_mse", "min"),
+            ("val_rmse", "min"),
+            ("val_accuracy", "max"),
+            ("loss", "min"),
+            ("mae", "min"),
+            ("mse", "min"),
+            ("rmse", "min"),
+            ("accuracy", "max"),
+        ]
+
+        for name, direction in metric_preferences:
+            values = history.get(name)
+            if values:
+                return MetricSnapshot(name=name, value=float(values[-1]), direction=direction)
+
+        for name, values in history.items():
+            if not values:
+                continue
+            direction = "max" if "acc" in name.lower() or "auc" in name.lower() else "min"
+            return MetricSnapshot(name=name, value=float(values[-1]), direction=direction)
+
+        return None
+
+    def _classify_change(
+        self,
+        previous_history: dict[str, list[float]],
+        current_history: dict[str, list[float]],
+    ) -> tuple[str | None, MetricSnapshot | None, MetricSnapshot | None]:
+        previous_metric = self._select_primary_metric(previous_history)
+        current_metric = self._select_primary_metric(current_history)
+
+        if previous_metric is None or current_metric is None:
+            return None, previous_metric, current_metric
+
+        if previous_metric.name != current_metric.name:
+            return None, previous_metric, current_metric
+
+        if previous_metric.direction == "min":
+            if current_metric.value < previous_metric.value:
+                return "improved", previous_metric, current_metric
+            if current_metric.value > previous_metric.value:
+                return "worsened", previous_metric, current_metric
+        else:
+            if current_metric.value > previous_metric.value:
+                return "improved", previous_metric, current_metric
+            if current_metric.value < previous_metric.value:
+                return "worsened", previous_metric, current_metric
+
+        return None, previous_metric, current_metric
+
+    def _summarize_change(
+        self,
+        iteration: int,
+        previous_response: str,
+        current_response: str,
+        previous_metric: MetricSnapshot,
+        current_metric: MetricSnapshot,
+        diff_line_limit: int = 12,
+    ) -> str:
+        diff_lines: list[str] = []
+        for line in difflib.unified_diff(
+            previous_response.splitlines(),
+            current_response.splitlines(),
+            fromfile=f"iter_{iteration}",
+            tofile=f"iter_{iteration + 1}",
+            lineterm="",
+            n=0,
+        ):
+            if line.startswith("@@") or line.startswith("---") or line.startswith("+++"):
+                continue
+            if line:
+                diff_lines.append(line)
+            if len(diff_lines) >= diff_line_limit:
+                break
+
+        if len(diff_lines) >= diff_line_limit:
+            diff_lines.append("...")
+
+        diff_text = " ".join(diff_lines) if diff_lines else "No diff captured."
+        previous_iteration = iteration
+        current_iteration = iteration + 1
+        metric_summary = f"{current_metric.name} {previous_metric.value:.4g} -> {current_metric.value:.4g}"
+        return f"Iterations {previous_iteration}->{current_iteration}: {metric_summary}; key changes: {diff_text}"
+
+    def _record_iteration_result(
+        self,
+        iteration: int,
+        response: str,
+        history: dict[str, list[float]],
+    ) -> None:
+        stored_history = {key: list(values) for key, values in history.items()}
+        previous_entry = self.model_iterations[-1] if self.model_iterations else None
+
+        if previous_entry:
+            change_type, previous_metric, current_metric = self._classify_change(
+                previous_entry["history"], stored_history
+            )
+            if change_type in {"improved", "worsened"} and previous_metric and current_metric:
+                summary = self._summarize_change(
+                    iteration,
+                    previous_entry["response"],
+                    response,
+                    previous_metric,
+                    current_metric,
+                )
+                target_list = self.improved_changes if change_type == "improved" else self.worsened_changes
+                target_list.append(summary)
+                if len(target_list) > 10:
+                    target_list.pop(0)
+
+        self.model_iterations.append(
+            {"iteration": iteration, "response": response, "history": stored_history}
+        )
 
     def _build_callbacks(self) -> list[keras.callbacks.Callback]:
         if self.callbacks_factory is None:
@@ -272,6 +415,10 @@ Current Best Model Results:
     def fit(self, max_iterations: int = 1, verbose: int = 1) -> dict:
         self.max_iterations = max_iterations
 
+        self.model_iterations.clear()
+        self.improved_changes.clear()
+        self.worsened_changes.clear()
+
         overall_results = {"history": {}, "models": []}
 
         for iteration in range(max_iterations):
@@ -301,6 +448,7 @@ Current Best Model Results:
                     overall_results["history"][history_key] = []
                 overall_results["history"][history_key].append(history_values[-1])
 
+            self._record_iteration_result(iteration, response, results.history)
 
             if (min(self.best_model_results["val_loss"]) > min(results.history["val_loss"]) and min(self.best_model_results["loss"]) > min(results.history["loss"])) if self.best_model_results is not None else True:
                 self.best_model = response
@@ -309,4 +457,8 @@ Current Best Model Results:
                 if verbose > 0:
                     print(f"New best model found and saved to {self.best_model_path}")
 
+        overall_results["improved_changes"] = list(self.improved_changes)
+        overall_results["worsened_changes"] = list(self.worsened_changes)
+
         return overall_results
+
