@@ -154,12 +154,11 @@ def main() -> None:
     )
 
     # Limit iterations to keep the demo lightweight.
-    results = model.fit(max_iterations=20)
+    results = model.fit(max_iterations=100)
     print(results["history"])
-    plot_results('loss', results["history"]['loss'])
-    plot_results('val_loss', results["history"]['val_loss'])
-    plot_results('mae', results["history"]['mae'])
-    plot_results('val_mae', results["history"]['val_mae'])
+
+    for key, values in results["history"].items():
+        plot_results(key, values)
 
     if not model.best_model_path.exists():
         raise RuntimeError(
