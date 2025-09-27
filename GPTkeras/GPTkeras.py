@@ -73,7 +73,7 @@ class GPTkeras:
             tf.random.set_seed(seed)
 
     def chat(self, messages) -> str:
-        print(messages)
+        # print(messages)
         if self.gpt_client is None:
             raise ValueError("OpenAIChatClient instance is required to chat")
         completion = self.gpt_client.chat.completions.create(model=self.gpt_model, messages=messages)
@@ -81,7 +81,7 @@ class GPTkeras:
         response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
         if not isinstance(response, str):
             response = "" if response is None else str(response)
-        print(response)
+        # print(response)
         return response
 
     def build_model(self) -> keras.Model:
@@ -227,6 +227,7 @@ Requirements:
 8. Always include at least one form of regularisation such as Dropout, kernel/bias weight decay, or BatchNormalization layers.
 9. Add input normalisation or rescaling layers that suit the data type so the model sees well-scaled inputs.
 10. Ensure the final layer activation and compiled loss exactly match the task type (binary classification, multi-class classification, or regression).
+11. You must use a EarlyStopping callback with restore_best_weights=True so the best model is always in memory after training.
 
 Current Best Model:
 {self.best_model if self.best_model is not None else 'No best model yet'}
@@ -450,7 +451,8 @@ Current Best Model Results:
 
             self._record_iteration_result(iteration, response, results.history)
 
-            if (min(self.best_model_results["val_loss"]) > min(results.history["val_loss"]) and min(self.best_model_results["loss"]) > min(results.history["loss"])) if self.best_model_results is not None else True:
+            # if (min(self.best_model_results["val_loss"]) > min(results.history["val_loss"]) and min(self.best_model_results["loss"]) > min(results.history["loss"])) if self.best_model_results is not None else True:
+            if (self.best_model_results["val_loss"][-1] > results.history["val_loss"][-1] and self.best_model_results["loss"][-1] > results.history["loss"][-1]) if self.best_model_results is not None else True:
                 self.best_model = response
                 self.best_model_results = results.history
                 self.model.save(self.best_model_path)
