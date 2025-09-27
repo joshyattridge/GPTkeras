@@ -10,10 +10,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Tuple
 
+# Enforce deterministic TensorFlow behaviour before importing it.
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from openai import OpenAI
+
+try:
+    # Ensures deterministic kernels when supported (no-op otherwise).
+    tf.config.experimental.enable_op_determinism()
+except (AttributeError, ValueError):
+    pass
 
 DEFAULT_SEED = 42
 
@@ -76,7 +87,13 @@ class GPTkeras:
         # print(messages)
         if self.gpt_client is None:
             raise ValueError("OpenAIChatClient instance is required to chat")
-        completion = self.gpt_client.chat.completions.create(model=self.gpt_model, messages=messages)
+        completion = self.gpt_client.chat.completions.create(
+            model=self.gpt_model,
+            messages=messages,
+            temperature=0,
+            top_p=1,
+            seed=int(self.seed) if self.seed is not None else DEFAULT_SEED,
+        )
         message = completion.choices[0].message
         response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
         if not isinstance(response, str):
@@ -423,6 +440,8 @@ Current Best Model Results:
         overall_results = {"history": {}, "models": []}
 
         for iteration in range(max_iterations):
+            if self.seed is not None:
+                self._set_seed(int(self.seed) + int(iteration))
             self.model, response = self.build_model()
             if "epochs" not in self.training_config or "batch_size" not in self.training_config:
                 raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
@@ -463,4 +482,3 @@ Current Best Model Results:
         overall_results["worsened_changes"] = list(self.worsened_changes)
 
         return overall_results
-
