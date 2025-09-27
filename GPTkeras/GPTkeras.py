@@ -84,6 +84,7 @@ class GPTkeras:
         prompt = self._build_prompt(sample_inputs=sample_inputs, sample_outputs=sample_outputs)
 
         response = self.chat([{"role": "user", "content": prompt}]).strip()
+        response = self._strip_code_fences(response)
         if not response:
             raise RuntimeError("GPT did not return any model code")
 
@@ -126,6 +127,24 @@ class GPTkeras:
             raise TypeError("create_model must return a compiled keras.Model instance")
 
         return model, response
+
+    @staticmethod
+    def _strip_code_fences(response: str) -> str:
+        if not response.startswith("```"):
+            return response
+
+        lines = response.splitlines()
+        if not lines:
+            return response
+
+        first_line = lines[0]
+        if first_line.startswith("```"):
+            lines = lines[1:]
+
+        while lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+
+        return "\n".join(lines).strip()
 
     def _summarize_array(self, array: np.ndarray, max_preview_values: int = 128) -> dict[str, object]:
         summary: dict[str, object] = {
