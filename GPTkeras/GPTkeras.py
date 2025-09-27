@@ -430,6 +430,12 @@ Current Best Model Results:
             print()
             print()
 
+    def _best_metric_value(self, history: dict[str, list[float]], name: str) -> float | None:
+        vals = history.get(name)
+        if not vals:
+            return None
+        return float(np.nanmin(vals))
+
     def fit(self, max_iterations: int = 1, verbose: int = 1) -> dict:
         self.max_iterations = max_iterations
 
@@ -440,8 +446,6 @@ Current Best Model Results:
         overall_results = {"history": {}, "models": []}
 
         for iteration in range(max_iterations):
-            if self.seed is not None:
-                self._set_seed(int(self.seed) + int(iteration))
             self.model, response = self.build_model()
             if "epochs" not in self.training_config or "batch_size" not in self.training_config:
                 raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
@@ -470,13 +474,16 @@ Current Best Model Results:
 
             self._record_iteration_result(iteration, response, results.history)
 
-            # if (min(self.best_model_results["val_loss"]) > min(results.history["val_loss"]) and min(self.best_model_results["loss"]) > min(results.history["loss"])) if self.best_model_results is not None else True:
-            if (self.best_model_results["val_loss"][-1] > results.history["val_loss"][-1] and self.best_model_results["loss"][-1] > results.history["loss"][-1]) if self.best_model_results is not None else True:
+            curr_best_val = self._best_metric_value(results.history, "val_loss")
+            prev_best_val = self._best_metric_value(self.best_model_results, "val_loss") if self.best_model_results else None
+
+            if prev_best_val is None or (curr_best_val is not None and curr_best_val < prev_best_val):
                 self.best_model = response
                 self.best_model_results = results.history
                 self.model.save(self.best_model_path)
                 if verbose > 0:
-                    print(f"New best model found and saved to {self.best_model_path}")
+                    print(f"New best model (min val_loss={curr_best_val:.4g}) saved to {self.best_model_path}")
+
 
         overall_results["improved_changes"] = list(self.improved_changes)
         overall_results["worsened_changes"] = list(self.worsened_changes)
