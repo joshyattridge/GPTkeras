@@ -252,10 +252,10 @@ Current Best Model Results:
 {self.best_model_results if self.best_model_results is not None else 'N/A'}
 """
 
-        # if self.improved_changes:
-        #     prompt += "\n\nPast Changes That Helped:\n"
-        #     for change in self.improved_changes[-5:]:
-        #         prompt += f"- {change}\n"
+        if self.improved_changes:
+            prompt += "\n\nPast Changes That Helped:\n"
+            for change in self.improved_changes[-5:]:
+                prompt += f"- {change}\n"
 
         if self.worsened_changes:
             prompt += "\nPast Changes That Hurt:\n"
@@ -284,13 +284,16 @@ Current Best Model Results:
         for name, direction in metric_preferences:
             values = history.get(name)
             if values:
-                return MetricSnapshot(name=name, value=float(values[-1]), direction=direction)
+                best = float(np.nanmin(values)) if direction == "min" else float(np.nanmax(values))
+                return MetricSnapshot(name=name, value=best, direction=direction)
 
+        # fallback: first metric found, use best according to inferred direction
         for name, values in history.items():
             if not values:
                 continue
-            direction = "max" if "acc" in name.lower() or "auc" in name.lower() else "min"
-            return MetricSnapshot(name=name, value=float(values[-1]), direction=direction)
+            direction = "max" if ("acc" in name.lower() or "auc" in name.lower()) else "min"
+            best = float(np.nanmin(values)) if direction == "min" else float(np.nanmax(values))
+            return MetricSnapshot(name=name, value=best, direction=direction)
 
         return None
 
@@ -436,7 +439,12 @@ Current Best Model Results:
             return None
         return float(np.nanmin(vals))
 
-    def fit(self, max_iterations: int = 1, verbose: int = 1) -> dict:
+    def fit(
+        self,
+        max_iterations: int = 1,
+        verbose: int = 1,
+        validation_split: float | None = 0.2,
+    ) -> dict:
         self.max_iterations = max_iterations
 
         self.model_iterations.clear()
@@ -444,6 +452,37 @@ Current Best Model Results:
         self.worsened_changes.clear()
 
         overall_results = {"history": {}, "models": []}
+
+        train_inputs = self.train_x
+        train_targets = self.train_y
+        validation_data: tuple[object, object] | None = None
+
+        if validation_split is not None:
+            if validation_split < 0:
+                raise ValueError("validation_split must be non-negative")
+
+            if validation_split > 0:
+                dataset_size = len(self.train_x)
+                if dataset_size < 2:
+                    raise ValueError("validation_split requires at least two samples")
+
+                indices = np.arange(dataset_size)
+                np.random.shuffle(indices)
+
+                validation_count = int(np.ceil(dataset_size * validation_split))
+                validation_count = max(1, validation_count)
+
+                if validation_count >= dataset_size:
+                    raise ValueError(
+                        "validation_split is too large; no samples would remain for training"
+                    )
+
+                val_indices = indices[:validation_count]
+                train_indices = indices[validation_count:]
+
+                train_inputs = self.train_x[train_indices]
+                train_targets = self.train_y[train_indices]
+                validation_data = (self.train_x[val_indices], self.train_y[val_indices])
 
         for iteration in range(max_iterations):
             self.model, response = self.build_model()
@@ -455,15 +494,19 @@ Current Best Model Results:
             callbacks = self._build_callbacks() 
             if verbose > 0:
                 callbacks.append(self.SingleLineLogger(model_iteration=iteration))
-            results = self.model.fit(
-                self.train_x,
-                self.train_y,
+            fit_kwargs = dict(
+                x=train_inputs,
+                y=train_targets,
                 epochs=epochs,
                 batch_size=batch_size,
-                validation_split=0.2,
                 callbacks=callbacks,
                 verbose=0,
             )
+
+            if validation_data is not None:
+                fit_kwargs["validation_data"] = validation_data
+
+            results = self.model.fit(**fit_kwargs)
 
             overall_results["models"].append(self.model)
 
