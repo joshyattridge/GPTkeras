@@ -4,6 +4,8 @@ import difflib
 import json
 import os
 import random
+import io
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Tuple
@@ -62,6 +64,7 @@ class GPTkeras:
         self.gpt_client = OpenAI(api_key=api_key)
         self.gpt_model = model
         self.training_config: dict[str, int] = {}
+        self.previous_model_summaries: list[str] = []
         self.best_model_path = Path("best_model.keras")
         self.best_model = None
         self.best_model_response = None
@@ -221,6 +224,7 @@ If you know of any previous models that you created and the results they produce
 You can make small architectural or hyperparameter changes because you will have {self.max_iterations} opportunities to iterate; focus on steady improvements while guarding against overfitting or underfitting.
 But make sure that you are showing steady improvements before you reach {self.max_iterations} iterations.
 Treat the "Current Best Model" shown below as your baseline: keep each revision incremental and tweak at most one or two layers or hyperparameters so diffs stay small.
+Remember you can vary the number of epochs you can use incase arent given enough to train the model well.
 
 Project constraints:
 - Training input shape: {input_shape}
@@ -228,7 +232,6 @@ Project constraints:
 - Number of target classes: {self.num_classes}
 - Sample input summary: {inputs_summary}
 - Sample target summary: {outputs_summary}
-- The constant BEST_MODEL_PATH is available for saving checkpoints.
 
 Requirements:
 1. The function must be pure Python using tf.keras layers and return a compiled keras.Model instance.
@@ -531,6 +534,12 @@ Current Best Model Results:
             validation_data = (self.train_x[val_indices], self.train_y[val_indices])
             return train_inputs, train_targets, validation_data
 
+    def get_model_summary(self, model):
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            model.summary()
+        return stream.getvalue()
+
     def fit(
         self,
         max_iterations: int = 1, # Total number of model iterations to perform.
@@ -562,6 +571,15 @@ Current Best Model Results:
             no_improvement_counter = 0
             for iteration in range(max_iterations):
                 self.model, response = self.build_model()
+
+                summary_str = self.get_model_summary(self.model)
+                if summary_str in self.previous_model_summaries:
+                    print()
+                    print("Model summary is identical to a previous model. Skipping this iteration.")
+                    print()
+                    continue
+                self.previous_model_summaries.append(summary_str)
+
                 if "epochs" not in self.training_config or "batch_size" not in self.training_config:
                     raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
 
@@ -598,6 +616,9 @@ Current Best Model Results:
                     overall_results["history"][history_key].append(best_value)
 
                 self._record_iteration_result(iteration, response, results.history)
+
+                curr_best_val = self._best_metric_value(results.history, "val_loss")
+                prev_best_val = self._best_metric_value(self.best_model_results, "val_loss") if self.best_model_results else None
 
                 if prev_best_val is None or (curr_best_val is not None and curr_best_val < prev_best_val):
                     self.best_model = self.model
