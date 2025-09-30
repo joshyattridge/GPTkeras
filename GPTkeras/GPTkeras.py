@@ -1,126 +1,39 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Tuple
+
+# Enforce deterministic TensorFlow behaviour before importing it.
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from openai import OpenAI
 
-class OpenAIChatClient:
-    def __init__(
-        self,
-        api_key: str | None = None,
-        model: str = "gpt-4o-mini",
-        system_prompt: str | None = None,
-        history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
-        continue_from_history: bool = False,
-    ):
+try:
+    # Ensures deterministic kernels when supported (no-op otherwise).
+    tf.config.experimental.enable_op_determinism()
+except (AttributeError, ValueError):
+    pass
 
-        if not api_key:
-            raise ValueError("OpenAI API key not provided")
-
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
-        self.messages: list[dict[str, str]] = []
-        self.history_path = self._prepare_history_path(history_path)
-        self._initialize_history(continue_from_history)
-        if system_prompt:
-            self._append_message(role="system", content=system_prompt)
-
-    def chat(self, content: str, role: str = "user", **kwargs) -> str:
-        if not content:
-            raise ValueError("Message content must be provided")
-
-        self._append_message(role=role, content=content)
-        completion = self.client.chat.completions.create(model=self.model, messages=self.messages, **kwargs)
-        message = completion.choices[0].message
-        response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
-        if not isinstance(response, str):
-            response = "" if response is None else str(response)
-        self._append_message(role="assistant", content=response)
-        return response
-
-    def reset(self, system_prompt: str | None = None) -> None:
-        self.messages = []
-        self._record_history({"role": "event", "content": "conversation_reset"})
-        if system_prompt:
-            self._append_message(role="system", content=system_prompt)
-
-    def history(self) -> list[dict[str, str]]:
-        return list(self.messages)
-
-    def _prepare_history_path(self, history_path: str | os.PathLike[str] | None) -> Path | None:
-        if history_path is None:
-            return None
-
-        path = Path(history_path).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _append_message(self, role: str, content: str) -> None:
-        if not isinstance(content, str):
-            content = str(content)
-        message = {"role": role, "content": content}
-        self.messages.append(message)
-        self._record_history(message)
-
-    def _record_history(self, message: dict[str, str]) -> None:
-        if not self.history_path:
-            return
-
-        record = {
-            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            **message,
-        }
-        with self.history_path.open("a", encoding="utf-8") as history_file:
-            history_file.write(json.dumps(record) + "\n")
-
-    def _initialize_history(self, continue_from_history: bool) -> None:
-        if not self.history_path:
-            return
-
-        if continue_from_history:
-            if not self.history_path.exists():
-                return
-
-            try:
-                with self.history_path.open("r", encoding="utf-8") as history_file:
-                    for line in history_file:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        role = record.get("role")
-                        content = record.get("content")
-                        if role not in {"system", "user", "assistant"} or content is None:
-                            continue
-                        if not isinstance(content, str):
-                            content = str(content)
-                        self.messages.append({"role": role, "content": content})
-            except OSError:
-                pass
-        else:
-            try:
-                self.history_path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
+DEFAULT_SEED = 42
 
 
-
+@dataclass(frozen=True)
+class MetricSnapshot:
+    name: str
+    value: float
+    direction: str  # "min" or "max"
 
 class GPTkeras:
     def __init__(
@@ -131,10 +44,16 @@ class GPTkeras:
         model: str = "gpt-4o-mini",
         history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
         continue_from_history: bool = False,
+        seed: int | None = DEFAULT_SEED,
     ):
         self.train_x = train_x
         self.train_y = train_y
         self.input_shape = tuple(train_x.shape[1:]) if train_x.ndim > 1 else (1,)
+        if seed is not None and not isinstance(seed, (int, np.integer)):
+            raise TypeError("seed must be an integer or None")
+        self.seed = int(seed) if seed is not None else None
+        if self.seed is not None:
+            self._set_seed(self.seed)
         if np.issubdtype(train_y.dtype, np.integer):
             if train_y.ndim > 1 and train_y.shape[-1] > 1:
                 self.num_classes = int(train_y.shape[-1])
@@ -142,16 +61,45 @@ class GPTkeras:
                 self.num_classes = int(train_y.max()) + 1
         else:
             self.num_classes = 1
-        self.gpt_client = OpenAIChatClient(
-            api_key=api_key,
-            model=model,
-            history_path=history_path,
-            continue_from_history=continue_from_history,
-        )
+        self.gpt_client = OpenAI(api_key=api_key)
+        self.gpt_model = model
         self.training_config: dict[str, int] = {}
         self.best_model_path = Path("best_model.keras")
-        self.best_val_loss = float("inf")
+        self.best_model = None
+        self.best_model_response = None
+        self.best_model_results = None
+        self.overall_best_model = None
+        self.overall_best_model_results = None
         self.callbacks_factory: Callable[[], list[keras.callbacks.Callback]] | None = None
+        self.model_iterations: list[dict[str, object]] = []
+        self.improved_changes: list[str] = []
+        self.worsened_changes: list[str] = []
+
+    def _set_seed(self, seed: int) -> None:
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        try:
+            tf.keras.utils.set_random_seed(seed)
+        except AttributeError:
+            tf.random.set_seed(seed)
+        else:
+            tf.random.set_seed(seed)
+
+    def chat(self, messages) -> str:
+        # print(messages)
+        if self.gpt_client is None:
+            raise ValueError("OpenAIChatClient instance is required to chat")
+        completion = self.gpt_client.chat.completions.create(
+            model=self.gpt_model,
+            messages=messages,
+        )
+        message = completion.choices[0].message
+        response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+        if not isinstance(response, str):
+            response = "" if response is None else str(response)
+        # print(response)
+        return response
 
     def build_model(self) -> keras.Model:
         if self.gpt_client is None:
@@ -163,7 +111,10 @@ class GPTkeras:
         sample_outputs = self.train_y[: min(sample_size, len(self.train_y))]
         prompt = self._build_prompt(sample_inputs=sample_inputs, sample_outputs=sample_outputs)
 
-        response = self.gpt_client.chat(prompt)
+        response = self.chat([{"role": "user", "content": prompt}]).strip()
+        response = self._strip_code_fences(response)
+        if not response:
+            raise RuntimeError("GPT did not return any model code")
 
         exec_globals = {
             "keras": keras,
@@ -203,7 +154,25 @@ class GPTkeras:
         if not isinstance(model, keras.Model):
             raise TypeError("create_model must return a compiled keras.Model instance")
 
-        return model
+        return model, response
+
+    @staticmethod
+    def _strip_code_fences(response: str) -> str:
+        if not response.startswith("```"):
+            return response
+
+        lines = response.splitlines()
+        if not lines:
+            return response
+
+        first_line = lines[0]
+        if first_line.startswith("```"):
+            lines = lines[1:]
+
+        while lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+
+        return "\n".join(lines).strip()
 
     def _summarize_array(self, array: np.ndarray, max_preview_values: int = 128) -> dict[str, object]:
         summary: dict[str, object] = {
@@ -255,6 +224,7 @@ You are an expert TensorFlow engineer. Generate Python source code for a functio
 If you know of any previous models that you created and the results they produced then use this information to influence your design.
 You can make small architectural or hyperparameter changes because you will have {self.max_iterations} opportunities to iterate; focus on steady improvements while guarding against overfitting or underfitting.
 But make sure that you are showing steady improvements before you reach {self.max_iterations} iterations.
+Treat the "Current Best Model" shown below as your baseline: keep each revision incremental and tweak at most one or two layers or hyperparameters so diffs stay small.
 
 Project constraints:
 - Training input shape: {input_shape}
@@ -266,7 +236,7 @@ Project constraints:
 
 Requirements:
 1. The function must be pure Python using tf.keras layers and return a compiled keras.Model instance.
-2. Return valid Python that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include explanations or markdown fences.
+2. Respond with raw Python code that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include narrative text, comments outside of code, or any Markdown/backtick fences. The first non-empty line must start with either BATCH_SIZE or EPOCHS.
 3. Ensure BATCH_SIZE and EPOCHS are positive integers tailored to the task and data size.
 4. Design the network so every convolution, pooling, or downsampling step keeps all spatial dimensions at least 1 for the provided input shape; adjust kernel sizes, strides, or padding (e.g., prefer padding="same" when needed) to avoid invalid tensor shapes.
 5. Always define a create_callbacks() function with no parameters that returns a list (or tuple) of tf.keras.callbacks.Callback instances including EarlyStopping and a learning-rate scheduler (e.g., ReduceLROnPlateau or LearningRateScheduler); keep learning rates from decaying to zero by setting a positive floor (e.g., `min_lr > 0` or a cosine schedule with a floor). Callbacks that write checkpoints must target BEST_MODEL_PATH and avoid other locations.
@@ -275,8 +245,150 @@ Requirements:
 8. Always include at least one form of regularisation such as Dropout, kernel/bias weight decay, or BatchNormalization layers.
 9. Add input normalisation or rescaling layers that suit the data type so the model sees well-scaled inputs.
 10. Ensure the final layer activation and compiled loss exactly match the task type (binary classification, multi-class classification, or regression).
+11. You must use a EarlyStopping callback with restore_best_weights=True so the best model is always in memory after training.
+12. Preserve the overall architecture of the current best model and limit each revision to one or two targeted adjustments so weight loading remains compatible.
+
+Current Best Model:
+{self.best_model_response if self.best_model_response is not None else 'No best model yet'}
+Current Best Model Results:
+{self.best_model_results if self.best_model_results is not None else 'N/A'}
 """
+
+        if self.improved_changes:
+            prompt += "\n\nPast Changes That Helped:\n"
+            for change in self.improved_changes[-5:]:
+                prompt += f"- {change}\n"
+
+        if self.worsened_changes:
+            prompt += "\nPast Changes That Hurt:\n"
+            for change in self.worsened_changes[-5:]:
+                prompt += f"- {change}\n"
+
         return prompt.strip()
+
+    def _select_primary_metric(self, history: dict[str, list[float]]) -> MetricSnapshot | None:
+        if not history:
+            return None
+
+        metric_preferences = [
+            ("val_loss", "min"),
+            ("val_mae", "min"),
+            ("val_mse", "min"),
+            ("val_rmse", "min"),
+            ("val_accuracy", "max"),
+            ("loss", "min"),
+            ("mae", "min"),
+            ("mse", "min"),
+            ("rmse", "min"),
+            ("accuracy", "max"),
+        ]
+
+        for name, direction in metric_preferences:
+            values = history.get(name)
+            if values:
+                best = float(np.nanmin(values)) if direction == "min" else float(np.nanmax(values))
+                return MetricSnapshot(name=name, value=best, direction=direction)
+
+        # fallback: first metric found, use best according to inferred direction
+        for name, values in history.items():
+            if not values:
+                continue
+            direction = "max" if ("acc" in name.lower() or "auc" in name.lower()) else "min"
+            best = float(np.nanmin(values)) if direction == "min" else float(np.nanmax(values))
+            return MetricSnapshot(name=name, value=best, direction=direction)
+
+        return None
+
+    def _classify_change(
+        self,
+        previous_history: dict[str, list[float]],
+        current_history: dict[str, list[float]],
+    ) -> tuple[str | None, MetricSnapshot | None, MetricSnapshot | None]:
+        previous_metric = self._select_primary_metric(previous_history)
+        current_metric = self._select_primary_metric(current_history)
+
+        if previous_metric is None or current_metric is None:
+            return None, previous_metric, current_metric
+
+        if previous_metric.name != current_metric.name:
+            return None, previous_metric, current_metric
+
+        if previous_metric.direction == "min":
+            if current_metric.value < previous_metric.value:
+                return "improved", previous_metric, current_metric
+            if current_metric.value > previous_metric.value:
+                return "worsened", previous_metric, current_metric
+        else:
+            if current_metric.value > previous_metric.value:
+                return "improved", previous_metric, current_metric
+            if current_metric.value < previous_metric.value:
+                return "worsened", previous_metric, current_metric
+
+        return None, previous_metric, current_metric
+
+    def _summarize_change(
+        self,
+        iteration: int,
+        previous_response: str,
+        current_response: str,
+        previous_metric: MetricSnapshot,
+        current_metric: MetricSnapshot,
+        diff_line_limit: int = 12,
+    ) -> str:
+        diff_lines: list[str] = []
+        for line in difflib.unified_diff(
+            previous_response.splitlines(),
+            current_response.splitlines(),
+            fromfile=f"iter_{iteration}",
+            tofile=f"iter_{iteration + 1}",
+            lineterm="",
+            n=0,
+        ):
+            if line.startswith("@@") or line.startswith("---") or line.startswith("+++"):
+                continue
+            if line:
+                diff_lines.append(line)
+            if len(diff_lines) >= diff_line_limit:
+                break
+
+        if len(diff_lines) >= diff_line_limit:
+            diff_lines.append("...")
+
+        diff_text = " ".join(diff_lines) if diff_lines else "No diff captured."
+        previous_iteration = iteration
+        current_iteration = iteration + 1
+        metric_summary = f"{current_metric.name} {previous_metric.value:.4g} -> {current_metric.value:.4g}"
+        return f"Iterations {previous_iteration}->{current_iteration}: {metric_summary}; key changes: {diff_text}"
+
+    def _record_iteration_result(
+        self,
+        iteration: int,
+        response: str,
+        history: dict[str, list[float]],
+    ) -> None:
+        stored_history = {key: list(values) for key, values in history.items()}
+        previous_entry = self.model_iterations[-1] if self.model_iterations else None
+
+        if previous_entry:
+            change_type, previous_metric, current_metric = self._classify_change(
+                previous_entry["history"], stored_history
+            )
+            if change_type in {"improved", "worsened"} and previous_metric and current_metric:
+                summary = self._summarize_change(
+                    iteration,
+                    previous_entry["response"],
+                    response,
+                    previous_metric,
+                    current_metric,
+                )
+                target_list = self.improved_changes if change_type == "improved" else self.worsened_changes
+                target_list.append(summary)
+                if len(target_list) > 10:
+                    target_list.pop(0)
+
+        self.model_iterations.append(
+            {"iteration": iteration, "response": response, "history": stored_history}
+        )
 
     def _build_callbacks(self) -> list[keras.callbacks.Callback]:
         if self.callbacks_factory is None:
@@ -304,14 +416,6 @@ Requirements:
 
         return validated_callbacks
 
-    def _can_results_be_improved_prompt(self, history: dict) -> str:
-        prompt = f"""
-        This is the results of training the model you generated:
-        {history}
-        Do you think these results can be improved further with a different architecture or training configuration? Answer with a short yes or no and nothing else.
-        """
-        return prompt.strip()
-
     class SingleLineLogger(keras.callbacks.Callback):
         def __init__(self, model_iteration: int = 0):
             super().__init__()
@@ -331,55 +435,157 @@ Requirements:
             print()
             print()
 
-    def fit(self, max_iterations: int = 1, verbose: int = 1) -> dict:
+    @staticmethod
+    def _metric_uses_max(metric_name: str) -> bool:
+        lowered = metric_name.lower()
+        max_keywords = (
+            "acc",
+            "accuracy",
+            "auc",
+            "precision",
+            "recall",
+            "f1",
+            "ap",
+            "map",
+        )
+        return any(keyword in lowered for keyword in max_keywords)
+
+    def _aggregate_history_value(self, metric_name: str, values: list[float]) -> float:
+        if not values:
+            return float("nan")
+        if metric_name == "learning_rate":
+            return float(values[-1])
+        if self._metric_uses_max(metric_name):
+            return float(np.nanmax(values))
+        return float(np.nanmin(values))
+
+    def _best_metric_value(self, history: dict[str, list[float]], name: str) -> float | None:
+        vals = history.get(name)
+        if not vals:
+            return None
+        return self._aggregate_history_value(name, vals)
+
+    def fit(
+        self,
+        max_iterations: int = 1, # Total number of model iterations to perform.
+        early_stopping_patience: int = 0, # If the model does not improve for this many iterations, stop training early.
+        parallel_iterations: int = 1, # Number of model builds to run in parallel (this is needed as the initial model build can be a terrible baseline).
+        verbose: int = 1,
+        validation_split: float | None = 0.2,
+    ) -> dict:
         self.max_iterations = max_iterations
+
+        self.model_iterations.clear()
+        self.improved_changes.clear()
+        self.worsened_changes.clear()
 
         overall_results = {"history": {}, "models": []}
 
-        for iteration in range(max_iterations):
-            self.model = self.build_model()
-            if "epochs" not in self.training_config or "batch_size" not in self.training_config:
-                raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
+        train_inputs = self.train_x
+        train_targets = self.train_y
+        validation_data: tuple[object, object] | None = None
 
-            epochs = int(self.training_config["epochs"])
-            batch_size = int(self.training_config["batch_size"])
-            callbacks = self._build_callbacks() 
-            if verbose > 0:
-                callbacks.append(self.SingleLineLogger(model_iteration=iteration))
-            results = self.model.fit(
-                self.train_x,
-                self.train_y,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_split=0.2,
-                callbacks=callbacks,
-                verbose=0,
-            )
+        if validation_split is not None:
+            if validation_split < 0:
+                raise ValueError("validation_split must be non-negative")
 
-            overall_results["models"].append(self.model)
+            if validation_split > 0:
+                dataset_size = len(self.train_x)
+                if dataset_size < 2:
+                    raise ValueError("validation_split requires at least two samples")
 
-            for history_key, history_values in results.history.items():
-                if history_key not in overall_results["history"]:
-                    overall_results["history"][history_key] = []
-                overall_results["history"][history_key].append(history_values[-1])
+                indices = np.arange(dataset_size)
+                np.random.shuffle(indices)
 
-            val_losses = results.history.get("val_loss")
-            candidate_loss = min(val_losses) if val_losses else None
-            if candidate_loss is None:
-                train_losses = results.history.get("loss") or []
-                candidate_loss = min(train_losses) if train_losses else None
+                validation_count = int(np.ceil(dataset_size * validation_split))
+                validation_count = max(1, validation_count)
 
-            if candidate_loss is not None and candidate_loss < self.best_val_loss:
-                self.best_val_loss = candidate_loss
-                self.model.save(self.best_model_path)
+                if validation_count >= dataset_size:
+                    raise ValueError(
+                        "validation_split is too large; no samples would remain for training"
+                    )
 
-            can_results_be_improved = self.gpt_client.chat(self._can_results_be_improved_prompt(results.history)).strip().lower()
+                val_indices = indices[:validation_count]
+                train_indices = indices[validation_count:]
 
-            if "yes" not in can_results_be_improved.lower() and "no" not in can_results_be_improved.lower():
-                raise ValueError("GPT response to improvement prompt must be 'yes' or 'no'")
+                train_inputs = self.train_x[train_indices]
+                train_targets = self.train_y[train_indices]
+                validation_data = (self.train_x[val_indices], self.train_y[val_indices])
 
-            if "no" in can_results_be_improved.lower():
-                print("GPT determined that the model cannot be improved further.")
-                break
+        for p in range(parallel_iterations):
+            self.best_model = None
+            self.best_model_response = None
+            self.best_model_results = None
+
+            no_improvement_counter = 0
+            for iteration in range(max_iterations):
+                self.model, response = self.build_model()
+                if "epochs" not in self.training_config or "batch_size" not in self.training_config:
+                    raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
+
+                epochs = int(self.training_config["epochs"])
+                batch_size = int(self.training_config["batch_size"])
+                callbacks = self._build_callbacks() 
+                if verbose > 0:
+                    callbacks.append(self.SingleLineLogger(model_iteration=iteration))
+                fit_kwargs = dict(
+                    x=train_inputs,
+                    y=train_targets,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    callbacks=callbacks,
+                    verbose=0,
+                )
+
+                if validation_data is not None:
+                    fit_kwargs["validation_data"] = validation_data
+
+                results = self.model.fit(**fit_kwargs)
+
+                overall_results["models"].append(self.model)
+
+                for history_key, history_values in results.history.items():
+                    if history_key not in overall_results["history"]:
+                        overall_results["history"][history_key] = []
+                    best_value = self._aggregate_history_value(history_key, history_values)
+                    overall_results["history"][history_key].append(best_value)
+
+                self._record_iteration_result(iteration, response, results.history)
+
+                curr_best_val = self._best_metric_value(results.history, "val_loss")
+                prev_best_val = self._best_metric_value(self.best_model_results, "val_loss") if self.best_model_results else None
+
+                if prev_best_val is None or (curr_best_val is not None and curr_best_val < prev_best_val):
+                    self.best_model = self.model
+                    self.best_model_response = response
+                    self.best_model_results = results.history
+                    if verbose > 0:
+                        print(f"New best model (min val_loss={curr_best_val:.4g}) saved to {self.best_model_path}")
+                    no_improvement_counter = 0
+                else:
+                    no_improvement_counter += 1
+                    if no_improvement_counter >= early_stopping_patience > 0:
+                        print(f"Early stopping triggered after {early_stopping_patience} iterations without improvement.")
+                        break
+
+            overall_results["improved_changes"] = list(self.improved_changes)
+            overall_results["worsened_changes"] = list(self.worsened_changes)
+
+            if self.overall_best_model is None and self.best_model is not None:
+                self.overall_best_model = self.best_model
+                self.overall_best_model_results = self.best_model_results
+                if verbose > 0:
+                    overall_best_val = self._best_metric_value(self.overall_best_model_results, "val_loss")
+                    print(f"New overall best model (min val_loss={overall_best_val:.4g}) saved to {self.best_model_path}.")
+                self.overall_best_model.save(self.best_model_path)
+            elif self.best_model is not None and self.overall_best_model_results is not None:
+                overall_best_val = self._best_metric_value(self.overall_best_model_results, "val_loss")
+                current_best_val = self._best_metric_value(self.best_model_results, "val_loss")
+                if overall_best_val is None or (current_best_val is not None and current_best_val < overall_best_val):
+                    self.overall_best_model = self.best_model
+                    self.overall_best_model_results = self.best_model_results
+                    if verbose > 0:
+                        print(f"New overall best model (min val_loss={current_best_val:.4g}) updated.")
+                    self.overall_best_model.save(self.best_model_path)
 
         return overall_results
