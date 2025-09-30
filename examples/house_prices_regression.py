@@ -162,8 +162,7 @@ def main() -> None:
     )
 
     # Limit iterations to keep the demo lightweight.
-    results = model.fit(max_iterations=50, early_stopping_patience=5, parallel_iterations=10)
-    print(results["history"])
+    results = model.fit(max_iterations=100, early_stopping_patience=5, parallel_iterations=10)
 
     for key, values in results["history"].items():
         plot_results(key, values)

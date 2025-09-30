@@ -599,9 +599,6 @@ Current Best Model Results:
 
                 self._record_iteration_result(iteration, response, results.history)
 
-                curr_best_val = self._best_metric_value(results.history, "val_loss")
-                prev_best_val = self._best_metric_value(self.best_model_results, "val_loss") if self.best_model_results else None
-
                 if prev_best_val is None or (curr_best_val is not None and curr_best_val < prev_best_val):
                     self.best_model = self.model
                     self.best_model_response = response
