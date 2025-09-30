@@ -66,7 +66,10 @@ class GPTkeras:
         self.training_config: dict[str, int] = {}
         self.best_model_path = Path("best_model.keras")
         self.best_model = None
+        self.best_model_response = None
         self.best_model_results = None
+        self.overall_best_model = None
+        self.overall_best_model_results = None
         self.callbacks_factory: Callable[[], list[keras.callbacks.Callback]] | None = None
         self.model_iterations: list[dict[str, object]] = []
         self.improved_changes: list[str] = []
@@ -90,9 +93,6 @@ class GPTkeras:
         completion = self.gpt_client.chat.completions.create(
             model=self.gpt_model,
             messages=messages,
-            temperature=0,
-            top_p=1,
-            seed=int(self.seed) if self.seed is not None else DEFAULT_SEED,
         )
         message = completion.choices[0].message
         response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
@@ -249,7 +249,7 @@ Requirements:
 12. Preserve the overall architecture of the current best model and limit each revision to one or two targeted adjustments so weight loading remains compatible.
 
 Current Best Model:
-{self.best_model if self.best_model is not None else 'No best model yet'}
+{self.best_model_response if self.best_model_response is not None else 'No best model yet'}
 Current Best Model Results:
 {self.best_model_results if self.best_model_results is not None else 'N/A'}
 """
@@ -467,7 +467,9 @@ Current Best Model Results:
 
     def fit(
         self,
-        max_iterations: int = 1,
+        max_iterations: int = 1, # Total number of model iterations to perform.
+        early_stopping_patience: int = 0, # If the model does not improve for this many iterations, stop training early.
+        parallel_iterations: int = 1, # Number of model builds to run in parallel (this is needed as the initial model build can be a terrible baseline).
         verbose: int = 1,
         validation_split: float | None = 0.2,
     ) -> dict:
@@ -510,52 +512,80 @@ Current Best Model Results:
                 train_targets = self.train_y[train_indices]
                 validation_data = (self.train_x[val_indices], self.train_y[val_indices])
 
-        for iteration in range(max_iterations):
-            self.model, response = self.build_model()
-            if "epochs" not in self.training_config or "batch_size" not in self.training_config:
-                raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
+        for p in range(parallel_iterations):
+            self.best_model = None
+            self.best_model_response = None
+            self.best_model_results = None
 
-            epochs = int(self.training_config["epochs"])
-            batch_size = int(self.training_config["batch_size"])
-            callbacks = self._build_callbacks() 
-            if verbose > 0:
-                callbacks.append(self.SingleLineLogger(model_iteration=iteration))
-            fit_kwargs = dict(
-                x=train_inputs,
-                y=train_targets,
-                epochs=epochs,
-                batch_size=batch_size,
-                callbacks=callbacks,
-                verbose=0,
-            )
+            no_improvement_counter = 0
+            for iteration in range(max_iterations):
+                self.model, response = self.build_model()
+                if "epochs" not in self.training_config or "batch_size" not in self.training_config:
+                    raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
 
-            if validation_data is not None:
-                fit_kwargs["validation_data"] = validation_data
-
-            results = self.model.fit(**fit_kwargs)
-
-            overall_results["models"].append(self.model)
-
-            for history_key, history_values in results.history.items():
-                if history_key not in overall_results["history"]:
-                    overall_results["history"][history_key] = []
-                best_value = self._aggregate_history_value(history_key, history_values)
-                overall_results["history"][history_key].append(best_value)
-
-            self._record_iteration_result(iteration, response, results.history)
-
-            curr_best_val = self._best_metric_value(results.history, "val_mae")
-            prev_best_val = self._best_metric_value(self.best_model_results, "val_mae") if self.best_model_results else None
-
-            if prev_best_val is None or (curr_best_val is not None and curr_best_val < prev_best_val):
-                self.best_model = response
-                self.best_model_results = results.history
-                self.model.save(self.best_model_path)
+                epochs = int(self.training_config["epochs"])
+                batch_size = int(self.training_config["batch_size"])
+                callbacks = self._build_callbacks() 
                 if verbose > 0:
-                    print(f"New best model (min val_mae={curr_best_val:.4g}) saved to {self.best_model_path}")
+                    callbacks.append(self.SingleLineLogger(model_iteration=iteration))
+                fit_kwargs = dict(
+                    x=train_inputs,
+                    y=train_targets,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    callbacks=callbacks,
+                    verbose=0,
+                )
 
+                if validation_data is not None:
+                    fit_kwargs["validation_data"] = validation_data
 
-        overall_results["improved_changes"] = list(self.improved_changes)
-        overall_results["worsened_changes"] = list(self.worsened_changes)
+                results = self.model.fit(**fit_kwargs)
+
+                overall_results["models"].append(self.model)
+
+                for history_key, history_values in results.history.items():
+                    if history_key not in overall_results["history"]:
+                        overall_results["history"][history_key] = []
+                    best_value = self._aggregate_history_value(history_key, history_values)
+                    overall_results["history"][history_key].append(best_value)
+
+                self._record_iteration_result(iteration, response, results.history)
+
+                curr_best_val = self._best_metric_value(results.history, "val_loss")
+                prev_best_val = self._best_metric_value(self.best_model_results, "val_loss") if self.best_model_results else None
+
+                if prev_best_val is None or (curr_best_val is not None and curr_best_val < prev_best_val):
+                    self.best_model = self.model
+                    self.best_model_response = response
+                    self.best_model_results = results.history
+                    if verbose > 0:
+                        print(f"New best model (min val_loss={curr_best_val:.4g}) saved to {self.best_model_path}")
+                    no_improvement_counter = 0
+                else:
+                    no_improvement_counter += 1
+                    if no_improvement_counter >= early_stopping_patience > 0:
+                        print(f"Early stopping triggered after {early_stopping_patience} iterations without improvement.")
+                        break
+
+            overall_results["improved_changes"] = list(self.improved_changes)
+            overall_results["worsened_changes"] = list(self.worsened_changes)
+
+            if self.overall_best_model is None and self.best_model is not None:
+                self.overall_best_model = self.best_model
+                self.overall_best_model_results = self.best_model_results
+                if verbose > 0:
+                    overall_best_val = self._best_metric_value(self.overall_best_model_results, "val_loss")
+                    print(f"New overall best model (min val_loss={overall_best_val:.4g}) saved to {self.best_model_path}.")
+                self.overall_best_model.save(self.best_model_path)
+            elif self.best_model is not None and self.overall_best_model_results is not None:
+                overall_best_val = self._best_metric_value(self.overall_best_model_results, "val_loss")
+                current_best_val = self._best_metric_value(self.best_model_results, "val_loss")
+                if overall_best_val is None or (current_best_val is not None and current_best_val < overall_best_val):
+                    self.overall_best_model = self.best_model
+                    self.overall_best_model_results = self.best_model_results
+                    if verbose > 0:
+                        print(f"New overall best model (min val_loss={current_best_val:.4g}) updated.")
+                    self.overall_best_model.save(self.best_model_path)
 
         return overall_results
