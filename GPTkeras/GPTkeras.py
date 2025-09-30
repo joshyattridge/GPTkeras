@@ -414,25 +414,63 @@ Current Best Model Results:
 
         return validated_callbacks
 
-    class SingleLineLogger(keras.callbacks.Callback):
+    class ProgressBarLogger(keras.callbacks.Callback):
+        """Keras callback that renders a progress bar per training run."""
+
         def __init__(self, parallel_iteration: int = 0, model_iteration: int = 0):
             super().__init__()
             self.parallel_iteration = parallel_iteration
             self.model_iteration = model_iteration
+            self._progbar: keras.utils.Progbar | None = None
 
-        # def on_train_begin(self, logs=None):
-        #     # Print model summary before training starts
-        #     if hasattr(self, 'model') and self.model is not None:
-        #         self.model.summary()
+        def on_train_begin(self, logs=None):
+            epochs = self.params.get("epochs") if isinstance(self.params, dict) else None
+            if self.model_iteration == 1:
+                print(
+                    f"Attempt {self.parallel_iteration}",
+                    flush=True,
+                )
+            if epochs is None:
+                return
+
+            self._progbar = keras.utils.Progbar(target=epochs, unit_name="epoch")
 
         def on_epoch_end(self, epoch, logs=None):
+            if self._progbar is None:
+                return
+
             logs = logs or {}
-            msg = f"Parallel {self.parallel_iteration}, Model {self.model_iteration}: " + ", ".join([f"{k}={v:.4f}" for k, v in logs.items()])
-            print(f"\r{msg}", end='')
+            values: list[tuple[str, float]] = []
+
+            if "Model" not in self._progbar._values_order:
+                self._progbar._values_order.insert(0, "Model")
+            self._progbar._values["Model"] = self.model_iteration
+
+            for key, value in logs.items():
+                if key in {"batch", "size"}:
+                    continue
+
+                try:
+                    numeric_value = float(np.asarray(value))
+                except (TypeError, ValueError):
+                    continue
+                values.append((key, numeric_value))
+
+            # +1 because epochs are zero-indexed inside the callback.
+            self._progbar.update(epoch + 1, values=values)
 
         def on_train_end(self, logs=None):
-            print()
-            print()
+            if self._progbar is None:
+                print()
+                return
+
+            # If training finished early, advance the bar to completion.
+            if (
+                getattr(self._progbar, "target", None) is not None
+                and getattr(self._progbar, "_seen_so_far", None) is not None
+                and self._progbar._seen_so_far < self._progbar.target
+            ):
+                self._progbar.update(self._progbar.target)
 
     @staticmethod
     def _metric_uses_max(metric_name: str) -> bool:
@@ -528,9 +566,14 @@ Current Best Model Results:
 
                 epochs = int(self.training_config["epochs"])
                 batch_size = int(self.training_config["batch_size"])
-                callbacks = self._build_callbacks() 
+                callbacks = self._build_callbacks()
                 if verbose > 0:
-                    callbacks.append(self.SingleLineLogger(parallel_iteration=p + 1, model_iteration=iteration + 1))
+                    callbacks.append(
+                        self.ProgressBarLogger(
+                            parallel_iteration=p + 1,
+                            model_iteration=iteration + 1,
+                        )
+                    )
                 fit_kwargs = dict(
                     x=train_inputs,
                     y=train_targets,
