@@ -224,6 +224,7 @@ You are an expert TensorFlow engineer. Generate Python source code for a functio
 If you know of any previous models that you created and the results they produced then use this information to influence your design.
 You can make small architectural or hyperparameter changes because you will have {self.max_iterations} opportunities to iterate; focus on steady improvements while guarding against overfitting or underfitting.
 But make sure that you are showing steady improvements before you reach {self.max_iterations} iterations.
+Treat the "Current Best Model" shown below as your baseline: keep each revision incremental and tweak at most one or two layers or hyperparameters so diffs stay small.
 
 Project constraints:
 - Training input shape: {input_shape}
@@ -245,6 +246,7 @@ Requirements:
 9. Add input normalisation or rescaling layers that suit the data type so the model sees well-scaled inputs.
 10. Ensure the final layer activation and compiled loss exactly match the task type (binary classification, multi-class classification, or regression).
 11. You must use a EarlyStopping callback with restore_best_weights=True so the best model is always in memory after training.
+12. Preserve the overall architecture of the current best model and limit each revision to one or two targeted adjustments so weight loading remains compatible.
 
 Current Best Model:
 {self.best_model if self.best_model is not None else 'No best model yet'}
@@ -433,11 +435,35 @@ Current Best Model Results:
             print()
             print()
 
+    @staticmethod
+    def _metric_uses_max(metric_name: str) -> bool:
+        lowered = metric_name.lower()
+        max_keywords = (
+            "acc",
+            "accuracy",
+            "auc",
+            "precision",
+            "recall",
+            "f1",
+            "ap",
+            "map",
+        )
+        return any(keyword in lowered for keyword in max_keywords)
+
+    def _aggregate_history_value(self, metric_name: str, values: list[float]) -> float:
+        if not values:
+            return float("nan")
+        if metric_name == "learning_rate":
+            return float(values[-1])
+        if self._metric_uses_max(metric_name):
+            return float(np.nanmax(values))
+        return float(np.nanmin(values))
+
     def _best_metric_value(self, history: dict[str, list[float]], name: str) -> float | None:
         vals = history.get(name)
         if not vals:
             return None
-        return float(np.nanmin(vals))
+        return self._aggregate_history_value(name, vals)
 
     def fit(
         self,
@@ -513,19 +539,20 @@ Current Best Model Results:
             for history_key, history_values in results.history.items():
                 if history_key not in overall_results["history"]:
                     overall_results["history"][history_key] = []
-                overall_results["history"][history_key].append(history_values[-1])
+                best_value = self._aggregate_history_value(history_key, history_values)
+                overall_results["history"][history_key].append(best_value)
 
             self._record_iteration_result(iteration, response, results.history)
 
-            curr_best_val = self._best_metric_value(results.history, "val_loss")
-            prev_best_val = self._best_metric_value(self.best_model_results, "val_loss") if self.best_model_results else None
+            curr_best_val = self._best_metric_value(results.history, "val_mae")
+            prev_best_val = self._best_metric_value(self.best_model_results, "val_mae") if self.best_model_results else None
 
             if prev_best_val is None or (curr_best_val is not None and curr_best_val < prev_best_val):
                 self.best_model = response
                 self.best_model_results = results.history
                 self.model.save(self.best_model_path)
                 if verbose > 0:
-                    print(f"New best model (min val_loss={curr_best_val:.4g}) saved to {self.best_model_path}")
+                    print(f"New best model (min val_mae={curr_best_val:.4g}) saved to {self.best_model_path}")
 
 
         overall_results["improved_changes"] = list(self.improved_changes)
