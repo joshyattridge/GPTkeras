@@ -147,6 +147,14 @@ def main() -> None:
 
     train_x, train_y, test_x, test_ids = _prepare_house_price_arrays()
 
+    # normalize all the data
+    train_x_mean = train_x.mean(axis=0, keepdims=True)
+    train_x_std = train_x.std(axis=0, keepdims=True) + 1
+    train_x = (train_x - train_x_mean) / train_x_std
+    test_x = (test_x - train_x_mean) / train_x_std
+
+    train_y = np.log1p(train_y)
+
     model = GPTkeras(
         train_x,
         train_y,
@@ -154,7 +162,7 @@ def main() -> None:
     )
 
     # Limit iterations to keep the demo lightweight.
-    results = model.fit(max_iterations=100)
+    results = model.fit(max_iterations=50, early_stopping_patience=5, parallel_iterations=10)
     print(results["history"])
 
     for key, values in results["history"].items():
@@ -169,7 +177,8 @@ def main() -> None:
     best_model = keras.models.load_model(model.best_model_path)
 
     print("Generating predictions for the Kaggle test set...")
-    predictions = best_model.predict(test_x, batch_size=256, verbose=0).reshape(-1)
+    predictions = best_model.predict(test_x).squeeze()
+    predictions = np.expm1(predictions)  # invert the log1p transformation
     predictions = np.clip(predictions, a_min=0.0, a_max=None)
 
     submission_path = _write_submission(predictions, test_ids)
