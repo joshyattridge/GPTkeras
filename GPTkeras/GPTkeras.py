@@ -87,7 +87,6 @@ class GPTkeras:
             tf.random.set_seed(seed)
 
     def chat(self, messages) -> str:
-        # print(messages)
         if self.gpt_client is None:
             raise ValueError("OpenAIChatClient instance is required to chat")
         completion = self.gpt_client.chat.completions.create(
@@ -98,7 +97,6 @@ class GPTkeras:
         response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
         if not isinstance(response, str):
             response = "" if response is None else str(response)
-        # print(response)
         return response
 
     def build_model(self) -> keras.Model:
@@ -417,18 +415,19 @@ Current Best Model Results:
         return validated_callbacks
 
     class SingleLineLogger(keras.callbacks.Callback):
-        def __init__(self, model_iteration: int = 0):
+        def __init__(self, parallel_iteration: int = 0, model_iteration: int = 0):
             super().__init__()
+            self.parallel_iteration = parallel_iteration
             self.model_iteration = model_iteration
 
-        def on_train_begin(self, logs=None):
-            # Print model summary before training starts
-            if hasattr(self, 'model') and self.model is not None:
-                self.model.summary()
+        # def on_train_begin(self, logs=None):
+        #     # Print model summary before training starts
+        #     if hasattr(self, 'model') and self.model is not None:
+        #         self.model.summary()
 
         def on_epoch_end(self, epoch, logs=None):
             logs = logs or {}
-            msg = f"Model {self.model_iteration}: " + ", ".join([f"{k}={v:.4f}" for k, v in logs.items()])
+            msg = f"Parallel {self.parallel_iteration}, Model {self.model_iteration}: " + ", ".join([f"{k}={v:.4f}" for k, v in logs.items()])
             print(f"\r{msg}", end='')
 
         def on_train_end(self, logs=None):
@@ -531,7 +530,7 @@ Current Best Model Results:
                 batch_size = int(self.training_config["batch_size"])
                 callbacks = self._build_callbacks() 
                 if verbose > 0:
-                    callbacks.append(self.SingleLineLogger(model_iteration=iteration))
+                    callbacks.append(self.SingleLineLogger(parallel_iteration=p + 1, model_iteration=iteration + 1))
                 fit_kwargs = dict(
                     x=train_inputs,
                     y=train_targets,
@@ -563,13 +562,10 @@ Current Best Model Results:
                     self.best_model = self.model
                     self.best_model_response = response
                     self.best_model_results = results.history
-                    if verbose > 0:
-                        print(f"New best model (min val_loss={curr_best_val:.4g}) saved to {self.best_model_path}")
                     no_improvement_counter = 0
                 else:
                     no_improvement_counter += 1
                     if no_improvement_counter >= early_stopping_patience > 0:
-                        print(f"Early stopping triggered after {early_stopping_patience} iterations without improvement.")
                         break
 
             overall_results["improved_changes"] = list(self.improved_changes)
@@ -580,7 +576,6 @@ Current Best Model Results:
                 self.overall_best_model_results = self.best_model_results
                 if verbose > 0:
                     overall_best_val = self._best_metric_value(self.overall_best_model_results, "val_loss")
-                    print(f"New overall best model (min val_loss={overall_best_val:.4g}) saved to {self.best_model_path}.")
                 self.overall_best_model.save(self.best_model_path)
             elif self.best_model is not None and self.overall_best_model_results is not None:
                 overall_best_val = self._best_metric_value(self.overall_best_model_results, "val_loss")
@@ -588,8 +583,6 @@ Current Best Model Results:
                 if overall_best_val is None or (current_best_val is not None and current_best_val < overall_best_val):
                     self.overall_best_model = self.best_model
                     self.overall_best_model_results = self.best_model_results
-                    if verbose > 0:
-                        print(f"New overall best model (min val_loss={current_best_val:.4g}) updated.")
                     self.overall_best_model.save(self.best_model_path)
 
         return overall_results
