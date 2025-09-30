@@ -420,6 +420,7 @@ Current Best Model Results:
             self.parallel_iteration = parallel_iteration
             self.model_iteration = model_iteration
             self._progbar: keras.utils.Progbar | None = None
+            self.best_values: dict[str, float] = {}
 
         def on_train_begin(self, logs=None):
             epochs = self.params.get("epochs") if isinstance(self.params, dict) else None
@@ -453,6 +454,8 @@ Current Best Model Results:
                 except (TypeError, ValueError):
                     continue
                 values.append((key, numeric_value))
+                self.best_values[key] = max(self.best_values.get(key, numeric_value), numeric_value) if GPTkeras._metric_uses_max(key) else min(self.best_values.get(key, numeric_value), numeric_value)
+                values.append((f"Best {key}", self.best_values[key]))
 
             # +1 because epochs are zero-indexed inside the callback.
             self._progbar.update(epoch + 1, values=values)
