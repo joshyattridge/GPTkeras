@@ -465,6 +465,34 @@ Current Best Model Results:
             return None
         return self._aggregate_history_value(name, vals)
 
+    def _validation_split(self, validation_split: float | None) -> Tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray] | None]:
+        if validation_split < 0:
+            raise ValueError("validation_split must be non-negative")
+
+        if validation_split > 0:
+            dataset_size = len(self.train_x)
+            if dataset_size < 2:
+                raise ValueError("validation_split requires at least two samples")
+
+            indices = np.arange(dataset_size)
+            np.random.shuffle(indices)
+
+            validation_count = int(np.ceil(dataset_size * validation_split))
+            validation_count = max(1, validation_count)
+
+            if validation_count >= dataset_size:
+                raise ValueError(
+                    "validation_split is too large; no samples would remain for training"
+                )
+
+            val_indices = indices[:validation_count]
+            train_indices = indices[validation_count:]
+
+            train_inputs = self.train_x[train_indices]
+            train_targets = self.train_y[train_indices]
+            validation_data = (self.train_x[val_indices], self.train_y[val_indices])
+            return train_inputs, train_targets, validation_data
+
     def fit(
         self,
         max_iterations: int = 1, # Total number of model iterations to perform.
@@ -485,32 +513,8 @@ Current Best Model Results:
         train_targets = self.train_y
         validation_data: tuple[object, object] | None = None
 
-        if validation_split is not None:
-            if validation_split < 0:
-                raise ValueError("validation_split must be non-negative")
-
-            if validation_split > 0:
-                dataset_size = len(self.train_x)
-                if dataset_size < 2:
-                    raise ValueError("validation_split requires at least two samples")
-
-                indices = np.arange(dataset_size)
-                np.random.shuffle(indices)
-
-                validation_count = int(np.ceil(dataset_size * validation_split))
-                validation_count = max(1, validation_count)
-
-                if validation_count >= dataset_size:
-                    raise ValueError(
-                        "validation_split is too large; no samples would remain for training"
-                    )
-
-                val_indices = indices[:validation_count]
-                train_indices = indices[validation_count:]
-
-                train_inputs = self.train_x[train_indices]
-                train_targets = self.train_y[train_indices]
-                validation_data = (self.train_x[val_indices], self.train_y[val_indices])
+        if validation_split is not None and validation_split > 0:
+            train_inputs, train_targets, validation_data = self._validation_split(validation_split)
 
         for p in range(parallel_iterations):
             self.best_model = None
