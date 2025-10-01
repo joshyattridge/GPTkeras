@@ -1,0 +1,21 @@
+flowchart TD
+    A[Define problem & constraints\n• Task, metric, budget, latency\n• Success criteria] --> B[Data audit & split\n• Train/Val/Test (stratified or time-based)\n• Leakage checks]
+    B --> C[Preprocess & features\n• Normalisation/Tokenisation\n• Augmentation (if images/audio)\n• Imbalance handling]
+    C --> D[Baseline model (Keras)\n• Small, proven arch\n• Sensible defaults]
+    D --> E[Compile\n• Loss & metric aligned to task\n• Optimiser: AdamW/SGD\n• Learning-rate schedule]
+    E --> F[Train (v1)\n• Callbacks: EarlyStopping, ReduceLROnPlateau, ModelCheckpoint\n• Mixed precision if supported]
+    F --> G[Evaluate on validation\n• Curves: loss/metric vs epoch\n• Confusion/PR curves as needed]
+    G --> H{Diagnosis}
+    H -->|Underfitting| I[Increase capacity\n• Wider/deeper\n• Train longer\n• Improve features]
+    H -->|Overfitting| J[Regularise more\n• Augment, Dropout, Weight decay\n• Reduce width/depth]
+    H -->|Optimisation issues| K[Tune training\n• LR range test\n• Batch size, schedule\n• Gradient clipping]
+    I --> L[Iterate & retrain]
+    J --> L
+    K --> L
+    L --> G
+    G --> M[Hyperparameter search (small)\n• Random/Bayesian over LR, WD, dropout, layers]
+    M --> N[Select best checkpoint\n• Re-train on Train+Val if appropriate\n• Final metrics on Test]
+    N --> O[Documentation & tracking\n• Seed, config, code hash\n• Model card, data version]
+    O --> P[Export & deploy\n• SavedModel/TF Serving/TFLite/ONNX\n• Latency & resource checks]
+    P --> Q[Monitor in production\n• Drift, performance, errors\n• Feedback loop to data/labels]
+    Q --> B

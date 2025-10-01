@@ -1,3 +1,29 @@
+# this project uses the power of chatgpt to generate keras models for any dataset/machine learning problem
+
+# flowchart TD
+#     A[Define problem & constraints\n• Task, metric, budget, latency\n• Success criteria] --> B[Data audit & split\n• Train/Val/Test (stratified or time-based)\n• Leakage checks]
+#     B --> C[Preprocess & features\n• Normalisation/Tokenisation\n• Augmentation (if images/audio)\n• Imbalance handling]
+#     C --> D[Baseline model (Keras)\n• Small, proven arch\n• Sensible defaults]
+#     D --> E[Compile\n• Loss & metric aligned to task\n• Optimiser: AdamW/SGD\n• Learning-rate schedule]
+#     E --> F[Train (v1)\n• Callbacks: EarlyStopping, ReduceLROnPlateau, ModelCheckpoint\n• Mixed precision if supported]
+#     F --> G[Evaluate on validation\n• Curves: loss/metric vs epoch\n• Confusion/PR curves as needed]
+#     G --> H{Diagnosis}
+#     H -->|Underfitting| I[Increase capacity\n• Wider/deeper\n• Train longer\n• Improve features]
+#     H -->|Overfitting| J[Regularise more\n• Augment, Dropout, Weight decay\n• Reduce width/depth]
+#     H -->|Optimisation issues| K[Tune training\n• LR range test\n• Batch size, schedule\n• Gradient clipping]
+#     I --> L[Iterate & retrain]
+#     J --> L
+#     K --> L
+#     L --> G
+#     G --> M[Hyperparameter search (small)\n• Random/Bayesian over LR, WD, dropout, layers]
+#     M --> N[Select best checkpoint\n• Re-train on Train+Val if appropriate\n• Final metrics on Test]
+#     N --> O[Documentation & tracking\n• Seed, config, code hash\n• Model card, data version]
+#     O --> P[Export & deploy\n• SavedModel/TF Serving/TFLite/ONNX\n• Latency & resource checks]
+#     P --> Q[Monitor in production\n• Drift, performance, errors\n• Feedback loop to data/labels]
+#     Q --> B
+
+
+
 from __future__ import annotations
 
 import difflib
@@ -10,641 +36,101 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Tuple
 
-# Enforce deterministic TensorFlow behaviour before importing it.
-os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
-os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from openai import OpenAI
 
-try:
-    # Ensures deterministic kernels when supported (no-op otherwise).
-    tf.config.experimental.enable_op_determinism()
-except (AttributeError, ValueError):
-    pass
+def chat(message):
+    client = OpenAI()
+    response = client.chat.completions.create(
+        model="gpt-4-turbo",
+        messages=[
+            {"role": "user", "content": message},
+        ],
+    )
+    return response.choices[0].message.content
 
-DEFAULT_SEED = 42
 
+def A_define_the_problem_and_constraints(train_x: np.ndarray, train_y: np.ndarray) -> str:
+    prompt = f"""
+You are an expert machine learning engineer. A user has provided you with a dataset to build a machine learning model.
+The training data has {train_x.shape[0]} samples and {train_x.shape[1]} features.
+The target variable has shape {train_y.shape}.
+Define the machine learning problem and constraints based on the data provided.
+this should include:
+- The type of task
+- The evaluation metric to be used
+- Any constraints such as budget, latency, or resource limitations
+Provide your answer in a concise manner.
 
-@dataclass(frozen=True)
-class MetricSnapshot:
-    name: str
-    value: float
-    direction: str  # "min" or "max"
-
-class GPTkeras:
-    def __init__(
-        self,
-        train_x,
-        train_y,
-        api_key: str | None = None,
-        model: str = "gpt-4o-mini",
-        history_path: str | os.PathLike[str] | None = "chat_history.jsonl",
-        continue_from_history: bool = False,
-        seed: int | None = DEFAULT_SEED,
-    ):
-        self.train_x = train_x
-        self.train_y = train_y
-        self.input_shape = tuple(train_x.shape[1:]) if train_x.ndim > 1 else (1,)
-        if seed is not None and not isinstance(seed, (int, np.integer)):
-            raise TypeError("seed must be an integer or None")
-        self.seed = int(seed) if seed is not None else None
-        if self.seed is not None:
-            self._set_seed(self.seed)
-        if np.issubdtype(train_y.dtype, np.integer):
-            if train_y.ndim > 1 and train_y.shape[-1] > 1:
-                self.num_classes = int(train_y.shape[-1])
-            else:
-                self.num_classes = int(train_y.max()) + 1
-        else:
-            self.num_classes = 1
-        self.gpt_client = OpenAI(api_key=api_key)
-        self.gpt_model = model
-        self.training_config: dict[str, int] = {}
-        self.previous_model_summaries: list[str] = []
-        self.best_model_path = Path("best_model.keras")
-        self.best_model = None
-        self.best_model_response = None
-        self.best_model_results = None
-        self.overall_best_model = None
-        self.overall_best_model_results = None
-        self.callbacks_factory: Callable[[], list[keras.callbacks.Callback]] | None = None
-        self.model_iterations: list[dict[str, object]] = []
-        self.improved_changes: list[str] = []
-        self.worsened_changes: list[str] = []
-
-    def _set_seed(self, seed: int) -> None:
-        os.environ["PYTHONHASHSEED"] = str(seed)
-        random.seed(seed)
-        np.random.seed(seed)
-        try:
-            tf.keras.utils.set_random_seed(seed)
-        except AttributeError:
-            tf.random.set_seed(seed)
-        else:
-            tf.random.set_seed(seed)
-
-    def chat(self, messages) -> str:
-        if self.gpt_client is None:
-            raise ValueError("OpenAIChatClient instance is required to chat")
-        completion = self.gpt_client.chat.completions.create(
-            model=self.gpt_model,
-            messages=messages,
-        )
-        message = completion.choices[0].message
-        response = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
-        if not isinstance(response, str):
-            response = "" if response is None else str(response)
-        return response
-
-    def build_model(self) -> keras.Model:
-        if self.gpt_client is None:
-            raise ValueError("OpenAIChatClient instance is required to build the model")
-
-        self.callbacks_factory = None
-        sample_size = min(5, len(self.train_x))
-        sample_inputs = self.train_x[: min(sample_size, len(self.train_x))]
-        sample_outputs = self.train_y[: min(sample_size, len(self.train_y))]
-        prompt = self._build_prompt(sample_inputs=sample_inputs, sample_outputs=sample_outputs)
-
-        response = self.chat([{"role": "user", "content": prompt}]).strip()
-        response = self._strip_code_fences(response)
-        if not response:
-            raise RuntimeError("GPT did not return any model code")
-
-        exec_globals = {
-            "keras": keras,
-            "tf": tf,
-            "np": np,
-            "Path": Path,
-            "BEST_MODEL_PATH": str(self.best_model_path),
-        }
-        exec_locals: dict[str, object] = {}
-        try:
-            exec(response, exec_globals, exec_locals)
-        except Exception as exc:
-            raise RuntimeError("Failed to execute model code generated by GPT") from exc
-
-        batch_size = exec_locals.get("BATCH_SIZE")
-        epochs = exec_locals.get("EPOCHS")
-
-        if not isinstance(batch_size, (int, np.integer)) or batch_size <= 0:
-            raise ValueError("GPT response must define a positive integer BATCH_SIZE constant.")
-        if not isinstance(epochs, (int, np.integer)) or epochs <= 0:
-            raise ValueError("GPT response must define a positive integer EPOCHS constant.")
-
-        self.training_config["batch_size"] = int(batch_size)
-        self.training_config["epochs"] = int(epochs)
-
-        create_model = exec_locals.get("create_model")
-        if not callable(create_model):
-            raise ValueError("GPT response did not define a callable create_model function")
-
-        create_callbacks = exec_locals.get("create_callbacks")
-        if create_callbacks is not None and not callable(create_callbacks):
-            raise ValueError("create_callbacks must be callable when defined")
-        if callable(create_callbacks):
-            self.callbacks_factory = create_callbacks
-
-        model = create_model()
-        if not isinstance(model, keras.Model):
-            raise TypeError("create_model must return a compiled keras.Model instance")
-
-        return model, response
-
-    @staticmethod
-    def _strip_code_fences(response: str) -> str:
-        if not response.startswith("```"):
-            return response
-
-        lines = response.splitlines()
-        if not lines:
-            return response
-
-        first_line = lines[0]
-        if first_line.startswith("```"):
-            lines = lines[1:]
-
-        while lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-
-        return "\n".join(lines).strip()
-
-    def _summarize_array(self, array: np.ndarray, max_preview_values: int = 128) -> dict[str, object]:
-        summary: dict[str, object] = {
-            "dtype": str(array.dtype),
-            "shape": list(array.shape),
-            "size": int(array.size),
-        }
-
-        if array.size == 0:
-            summary["sample_count"] = 0
-            summary["sample_description"] = "Array is empty"
-            summary["sample_values"] = []
-            return summary
-
-        is_numeric = np.issubdtype(array.dtype, np.number)
-
-        if is_numeric:
-            summary["min"] = float(np.min(array))
-            summary["max"] = float(np.max(array))
-            summary["mean"] = float(np.mean(array))
-            summary["std"] = float(np.std(array))
-
-        flat = array.reshape(-1)
-        if flat.size <= max_preview_values:
-            preview = flat
-            summary["sample_description"] = f"All {flat.size} values"
-        else:
-            indices = np.linspace(0, flat.size - 1, num=max_preview_values, dtype=int)
-            preview = flat[indices]
-            summary["sample_description"] = f"Uniform preview of {max_preview_values} values from {flat.size}"
-
-        if is_numeric:
-            preview = np.round(preview.astype(np.float64), decimals=6)
-
-        summary["sample_values"] = preview.tolist()
-        summary["sample_count"] = len(summary["sample_values"])
-
-        return summary
-
-    def _build_prompt(self, sample_inputs: np.ndarray, sample_outputs: np.ndarray) -> str:
-        input_shape = self.input_shape
-        output_shape = tuple(sample_outputs.shape[1:]) if sample_outputs.ndim > 1 else ()
-        task_type = "classification" if self.num_classes > 1 else "regression"
-        inputs_summary = json.dumps(self._summarize_array(sample_inputs), indent=2)
-        outputs_summary = json.dumps(self._summarize_array(sample_outputs), indent=2)
-
-        prompt = f"""
-You are an expert TensorFlow engineer. Generate Python source code for a function called create_model() that builds and compiles a tf.keras.Model for a {task_type} problem.
-If you know of any previous models that you created and the results they produced then use this information to influence your design.
-You can make small architectural or hyperparameter changes because you will have {self.max_iterations} opportunities to iterate; focus on steady improvements while guarding against overfitting or underfitting.
-But make sure that you are showing steady improvements before you reach {self.max_iterations} iterations.
-Treat the "Current Best Model" shown below as your baseline: keep each revision incremental and tweak at most one or two layers or hyperparameters so diffs stay small.
-Remember you can vary the number of epochs you can use incase arent given enough to train the model well.
-
-Project constraints:
-- Training input shape: {input_shape}
-- Training output shape: {output_shape if output_shape else 'scalar'}
-- Number of target classes: {self.num_classes}
-- Sample input summary: {inputs_summary}
-- Sample target summary: {outputs_summary}
-
-Requirements:
-1. The function must be pure Python using tf.keras layers and return a compiled keras.Model instance.
-2. Respond with raw Python code that defines create_model() and sets integer constants BATCH_SIZE and EPOCHS at module scope (outside create_model); do not include narrative text, comments outside of code, or any Markdown/backtick fences. The first non-empty line must start with either BATCH_SIZE or EPOCHS.
-3. Ensure BATCH_SIZE and EPOCHS are positive integers tailored to the task and data size.
-4. Design the network so every convolution, pooling, or downsampling step keeps all spatial dimensions at least 1 for the provided input shape; adjust kernel sizes, strides, or padding (e.g., prefer padding="same" when needed) to avoid invalid tensor shapes.
-5. Always define a create_callbacks() function with no parameters that returns a list (or tuple) of tf.keras.callbacks.Callback instances including EarlyStopping and a learning-rate scheduler (e.g., ReduceLROnPlateau or LearningRateScheduler); keep learning rates from decaying to zero by setting a positive floor (e.g., `min_lr > 0` or a cosine schedule with a floor). Callbacks that write checkpoints must target BEST_MODEL_PATH and avoid other locations.
-6. Keep the total number of trainable parameters reasonable for the dataset size; avoid unnecessarily large models.
-7. Do not use Flatten layers on high-dimensional feature maps—prefer pooling or global pooling to reduce dimensionality before any flattening step.
-8. Always include at least one form of regularisation such as Dropout, kernel/bias weight decay, or BatchNormalization layers.
-9. Add input normalisation or rescaling layers that suit the data type so the model sees well-scaled inputs.
-10. Ensure the final layer activation and compiled loss exactly match the task type (binary classification, multi-class classification, or regression).
-11. You must use a EarlyStopping callback with restore_best_weights=True so the best model is always in memory after training.
-12. Preserve the overall architecture of the current best model and limit each revision to one or two targeted adjustments so weight loading remains compatible.
-
-Current Best Model:
-{self.best_model_response if self.best_model_response is not None else 'No best model yet'}
-Current Best Model Results:
-{self.best_model_results if self.best_model_results is not None else 'N/A'}
+machine power {os.cpu_count()} cpu cores, {tf.config.experimental.get_memory_info('GPU:0')['current'] / (1024 ** 3):.2f} GB GPU memory
 """
+    return chat(prompt)
+
+def B_preprocess_and_feature_engineering(train_x: np.ndarray, train_y: np.ndarray, problem_definition: str):
+    prompt = f"""
+You are an expert machine learning engineer. A user has provided you with a dataset to build a machine learning model.
+The training data has {train_x.shape[0]} samples and {train_x.shape[1]} features.
+The target variable has shape {train_y.shape}.
+Please provide a python function that takes in the training data and performs preprocessing and feature engineering.
+The function should return the preprocessed training data.
+The function should be named `preprocess_data` and have the following signature:
+def preprocess_data(train_x: np.ndarray, train_y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+The function should include:
+- Normalization or standardization of numerical features
+- Encoding of categorical features
+- Handling of missing values
+- Any feature engineering steps you deem necessary
+The function should not include any model training or evaluation code.
+The function should be compatible with TensorFlow and Keras.
+Here is the problem definition:
+{problem_definition}
+Provide your answer in a python code block and nothing else.
+"""
+    return chat(prompt)
+
+def C_build_a_baseline_model(train_x: np.ndarray, train_y: np.ndarray, problem_definition: str):
+    prompt = f"""
+You are an expert machine learning engineer. A user has provided you with a dataset to build a machine learning model.
+The training data has {train_x.shape[0]} samples and {train_x.shape[1]} features.
+The target variable has shape {train_y.shape}.
+Please provide a python function that builds a baseline Keras model for the given problem.
+The function should be named `build_model` and have the following signature:
+def build_model(input_shape: Tuple[int, ...]) -> keras.Model:
+The function should include:
+- A simple and proven architecture suitable for the problem
+- Sensible default values for layers and activations
+- Compilation of the model with appropriate loss function, optimizer, and metrics
+The function should not include any data preprocessing or training code.
+The function should be compatible with TensorFlow and Keras.
+Here is the problem definition:
+{problem_definition}
+Provide your answer in a python code block and nothing else.
+"""   
+    return chat(prompt)
+
+
+
+def main(train_x: np.ndarray, train_y: np.ndarray):
+
+
+
+
+if __name__ == "__main__":
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set the OPENAI_API_KEY environment variable before running this script.")
+
+    train_x, train_y, test_x, test_ids = _prepare_house_price_arrays()
+
+    # normalize all the data
+    train_x_mean = train_x.mean(axis=0, keepdims=True)
+    train_x_std = train_x.std(axis=0, keepdims=True) + 1
+    train_x = (train_x - train_x_mean) / train_x_std
+    test_x = (test_x - train_x_mean) / train_x_std
+    train_y = np.log1p(train_y)
+
+    main(train_x, train_y)
 
-        if self.improved_changes:
-            prompt += "\n\nPast Changes That Helped:\n"
-            for change in self.improved_changes[-5:]:
-                prompt += f"- {change}\n"
 
-        if self.worsened_changes:
-            prompt += "\nPast Changes That Hurt:\n"
-            for change in self.worsened_changes[-5:]:
-                prompt += f"- {change}\n"
-
-        return prompt.strip()
-
-    def _select_primary_metric(self, history: dict[str, list[float]]) -> MetricSnapshot | None:
-        if not history:
-            return None
-
-        metric_preferences = [
-            ("val_loss", "min"),
-            ("val_mae", "min"),
-            ("val_mse", "min"),
-            ("val_rmse", "min"),
-            ("val_accuracy", "max"),
-            ("loss", "min"),
-            ("mae", "min"),
-            ("mse", "min"),
-            ("rmse", "min"),
-            ("accuracy", "max"),
-        ]
-
-        for name, direction in metric_preferences:
-            values = history.get(name)
-            if values:
-                best = float(np.nanmin(values)) if direction == "min" else float(np.nanmax(values))
-                return MetricSnapshot(name=name, value=best, direction=direction)
-
-        # fallback: first metric found, use best according to inferred direction
-        for name, values in history.items():
-            if not values:
-                continue
-            direction = "max" if ("acc" in name.lower() or "auc" in name.lower()) else "min"
-            best = float(np.nanmin(values)) if direction == "min" else float(np.nanmax(values))
-            return MetricSnapshot(name=name, value=best, direction=direction)
-
-        return None
-
-    def _classify_change(
-        self,
-        previous_history: dict[str, list[float]],
-        current_history: dict[str, list[float]],
-    ) -> tuple[str | None, MetricSnapshot | None, MetricSnapshot | None]:
-        previous_metric = self._select_primary_metric(previous_history)
-        current_metric = self._select_primary_metric(current_history)
-
-        if previous_metric is None or current_metric is None:
-            return None, previous_metric, current_metric
-
-        if previous_metric.name != current_metric.name:
-            return None, previous_metric, current_metric
-
-        if previous_metric.direction == "min":
-            if current_metric.value < previous_metric.value:
-                return "improved", previous_metric, current_metric
-            if current_metric.value > previous_metric.value:
-                return "worsened", previous_metric, current_metric
-        else:
-            if current_metric.value > previous_metric.value:
-                return "improved", previous_metric, current_metric
-            if current_metric.value < previous_metric.value:
-                return "worsened", previous_metric, current_metric
-
-        return None, previous_metric, current_metric
-
-    def _summarize_change(
-        self,
-        iteration: int,
-        previous_response: str,
-        current_response: str,
-        previous_metric: MetricSnapshot,
-        current_metric: MetricSnapshot,
-        diff_line_limit: int = 12,
-    ) -> str:
-        diff_lines: list[str] = []
-        for line in difflib.unified_diff(
-            previous_response.splitlines(),
-            current_response.splitlines(),
-            fromfile=f"iter_{iteration}",
-            tofile=f"iter_{iteration + 1}",
-            lineterm="",
-            n=0,
-        ):
-            if line.startswith("@@") or line.startswith("---") or line.startswith("+++"):
-                continue
-            if line:
-                diff_lines.append(line)
-            if len(diff_lines) >= diff_line_limit:
-                break
-
-        if len(diff_lines) >= diff_line_limit:
-            diff_lines.append("...")
-
-        diff_text = " ".join(diff_lines) if diff_lines else "No diff captured."
-        previous_iteration = iteration
-        current_iteration = iteration + 1
-        metric_summary = f"{current_metric.name} {previous_metric.value:.4g} -> {current_metric.value:.4g}"
-        return f"Iterations {previous_iteration}->{current_iteration}: {metric_summary}; key changes: {diff_text}"
-
-    def _record_iteration_result(
-        self,
-        iteration: int,
-        response: str,
-        history: dict[str, list[float]],
-    ) -> None:
-        stored_history = {key: list(values) for key, values in history.items()}
-        previous_entry = self.model_iterations[-1] if self.model_iterations else None
-
-        if previous_entry:
-            change_type, previous_metric, current_metric = self._classify_change(
-                previous_entry["history"], stored_history
-            )
-            if change_type in {"improved", "worsened"} and previous_metric and current_metric:
-                summary = self._summarize_change(
-                    iteration,
-                    previous_entry["response"],
-                    response,
-                    previous_metric,
-                    current_metric,
-                )
-                target_list = self.improved_changes if change_type == "improved" else self.worsened_changes
-                target_list.append(summary)
-                if len(target_list) > 10:
-                    target_list.pop(0)
-
-        self.model_iterations.append(
-            {"iteration": iteration, "response": response, "history": stored_history}
-        )
-
-    def _build_callbacks(self) -> list[keras.callbacks.Callback]:
-        if self.callbacks_factory is None:
-            return []
-
-        try:
-            callbacks = self.callbacks_factory()
-        except Exception as exc:
-            raise RuntimeError("create_callbacks() raised an exception") from exc
-
-        if callbacks is None:
-            return []
-        if not isinstance(callbacks, (list, tuple)):
-            raise TypeError("create_callbacks must return a list or tuple of keras.callbacks.Callback instances")
-
-        validated_callbacks: list[keras.callbacks.Callback] = []
-        for callback in callbacks:
-            if not isinstance(callback, keras.callbacks.Callback):
-                raise TypeError("create_callbacks must return keras.callbacks.Callback instances")
-
-            # Silence noisy checkpoint logging if the generated code enables it.
-            if isinstance(callback, keras.callbacks.ModelCheckpoint) and getattr(callback, "verbose", 0) != 0:
-                callback.verbose = 0
-            validated_callbacks.append(callback)
-
-        return validated_callbacks
-
-    class ProgressBarLogger(keras.callbacks.Callback):
-        """Keras callback that renders a progress bar per training run."""
-
-        def __init__(self, parallel_iteration: int = 0, model_iteration: int = 0):
-            super().__init__()
-            self.parallel_iteration = parallel_iteration
-            self.model_iteration = model_iteration
-            self._progbar: keras.utils.Progbar | None = None
-            self.best_values: dict[str, float] = {}
-
-        def on_train_begin(self, logs=None):
-            epochs = self.params.get("epochs") if isinstance(self.params, dict) else None
-            if self.model_iteration == 1:
-                print(
-                    f"Attempt {self.parallel_iteration}",
-                    flush=True,
-                )
-            if epochs is None:
-                return
-
-            self._progbar = keras.utils.Progbar(target=epochs, unit_name="epoch")
-
-        def on_epoch_end(self, epoch, logs=None):
-            if self._progbar is None:
-                return
-
-            logs = logs or {}
-            values: list[tuple[str, float]] = []
-
-            if "Model" not in self._progbar._values_order:
-                self._progbar._values_order.insert(0, "Model")
-            self._progbar._values["Model"] = self.model_iteration
-
-            for key, value in logs.items():
-                if key in {"batch", "size"}:
-                    continue
-
-                try:
-                    numeric_value = float(np.asarray(value))
-                except (TypeError, ValueError):
-                    continue
-                values.append((key, numeric_value))
-                self.best_values[key] = max(self.best_values.get(key, numeric_value), numeric_value) if GPTkeras._metric_uses_max(key) else min(self.best_values.get(key, numeric_value), numeric_value)
-                values.append((f"Best {key}", self.best_values[key]))
-
-            # +1 because epochs are zero-indexed inside the callback.
-            self._progbar.update(epoch + 1, values=values)
-
-        def on_train_end(self, logs=None):
-            if self._progbar is None:
-                print()
-                return
-
-            # If training finished early, advance the bar to completion.
-            if (
-                getattr(self._progbar, "target", None) is not None
-                and getattr(self._progbar, "_seen_so_far", None) is not None
-                and self._progbar._seen_so_far < self._progbar.target
-            ):
-                self._progbar.update(self._progbar.target)
-
-    @staticmethod
-    def _metric_uses_max(metric_name: str) -> bool:
-        lowered = metric_name.lower()
-        max_keywords = (
-            "acc",
-            "accuracy",
-            "auc",
-            "precision",
-            "recall",
-            "f1",
-            "ap",
-            "map",
-        )
-        return any(keyword in lowered for keyword in max_keywords)
-
-    def _aggregate_history_value(self, metric_name: str, values: list[float]) -> float:
-        if not values:
-            return float("nan")
-        if metric_name == "learning_rate":
-            return float(values[-1])
-        if self._metric_uses_max(metric_name):
-            return float(np.nanmax(values))
-        return float(np.nanmin(values))
-
-    def _best_metric_value(self, history: dict[str, list[float]], name: str) -> float | None:
-        vals = history.get(name)
-        if not vals:
-            return None
-        return self._aggregate_history_value(name, vals)
-
-    def _validation_split(self, validation_split: float | None) -> Tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray] | None]:
-        if validation_split < 0:
-            raise ValueError("validation_split must be non-negative")
-
-        if validation_split > 0:
-            dataset_size = len(self.train_x)
-            if dataset_size < 2:
-                raise ValueError("validation_split requires at least two samples")
-
-            indices = np.arange(dataset_size)
-            np.random.shuffle(indices)
-
-            validation_count = int(np.ceil(dataset_size * validation_split))
-            validation_count = max(1, validation_count)
-
-            if validation_count >= dataset_size:
-                raise ValueError(
-                    "validation_split is too large; no samples would remain for training"
-                )
-
-            val_indices = indices[:validation_count]
-            train_indices = indices[validation_count:]
-
-            train_inputs = self.train_x[train_indices]
-            train_targets = self.train_y[train_indices]
-            validation_data = (self.train_x[val_indices], self.train_y[val_indices])
-            return train_inputs, train_targets, validation_data
-
-    def get_model_summary(self, model):
-        stream = io.StringIO()
-        with redirect_stdout(stream):
-            model.summary()
-        return stream.getvalue()
-
-    def fit(
-        self,
-        max_iterations: int = 1, # Total number of model iterations to perform.
-        early_stopping_patience: int = 0, # If the model does not improve for this many iterations, stop training early.
-        parallel_iterations: int = 1, # Number of model builds to run in parallel (this is needed as the initial model build can be a terrible baseline).
-        verbose: int = 1,
-        validation_split: float | None = 0.2,
-    ) -> dict:
-        self.max_iterations = max_iterations
-
-        self.model_iterations.clear()
-        self.improved_changes.clear()
-        self.worsened_changes.clear()
-
-        overall_results = {"history": {}, "models": []}
-
-        train_inputs = self.train_x
-        train_targets = self.train_y
-        validation_data: tuple[object, object] | None = None
-
-        if validation_split is not None and validation_split > 0:
-            train_inputs, train_targets, validation_data = self._validation_split(validation_split)
-
-        for p in range(parallel_iterations):
-            self.best_model = None
-            self.best_model_response = None
-            self.best_model_results = None
-
-            no_improvement_counter = 0
-            for iteration in range(max_iterations):
-                self.model, response = self.build_model()
-
-                summary_str = self.get_model_summary(self.model)
-                if summary_str in self.previous_model_summaries:
-                    print()
-                    print("Model summary is identical to a previous model. Skipping this iteration.")
-                    print()
-                    continue
-                self.previous_model_summaries.append(summary_str)
-
-                if "epochs" not in self.training_config or "batch_size" not in self.training_config:
-                    raise ValueError("Training configuration missing; GPT must provide BATCH_SIZE and EPOCHS.")
-
-                epochs = int(self.training_config["epochs"])
-                batch_size = int(self.training_config["batch_size"])
-                callbacks = self._build_callbacks()
-                if verbose > 0:
-                    callbacks.append(
-                        self.ProgressBarLogger(
-                            parallel_iteration=p + 1,
-                            model_iteration=iteration + 1,
-                        )
-                    )
-                fit_kwargs = dict(
-                    x=train_inputs,
-                    y=train_targets,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    callbacks=callbacks,
-                    verbose=0,
-                )
-
-                if validation_data is not None:
-                    fit_kwargs["validation_data"] = validation_data
-
-                results = self.model.fit(**fit_kwargs)
-
-                overall_results["models"].append(self.model)
-
-                for history_key, history_values in results.history.items():
-                    if history_key not in overall_results["history"]:
-                        overall_results["history"][history_key] = []
-                    best_value = self._aggregate_history_value(history_key, history_values)
-                    overall_results["history"][history_key].append(best_value)
-
-                self._record_iteration_result(iteration, response, results.history)
-
-                curr_best_val = self._best_metric_value(results.history, "val_loss")
-                prev_best_val = self._best_metric_value(self.best_model_results, "val_loss") if self.best_model_results else None
-
-                if prev_best_val is None or (curr_best_val is not None and curr_best_val < prev_best_val):
-                    self.best_model = self.model
-                    self.best_model_response = response
-                    self.best_model_results = results.history
-                    no_improvement_counter = 0
-                else:
-                    no_improvement_counter += 1
-                    if no_improvement_counter >= early_stopping_patience > 0:
-                        break
-
-            overall_results["improved_changes"] = list(self.improved_changes)
-            overall_results["worsened_changes"] = list(self.worsened_changes)
-
-            if self.overall_best_model is None and self.best_model is not None:
-                self.overall_best_model = self.best_model
-                self.overall_best_model_results = self.best_model_results
-                if verbose > 0:
-                    overall_best_val = self._best_metric_value(self.overall_best_model_results, "val_loss")
-                self.overall_best_model.save(self.best_model_path)
-            elif self.best_model is not None and self.overall_best_model_results is not None:
-                overall_best_val = self._best_metric_value(self.overall_best_model_results, "val_loss")
-                current_best_val = self._best_metric_value(self.best_model_results, "val_loss")
-                if overall_best_val is None or (current_best_val is not None and current_best_val < overall_best_val):
-                    self.overall_best_model = self.best_model
-                    self.overall_best_model_results = self.best_model_results
-                    self.overall_best_model.save(self.best_model_path)
-
-        return overall_results
